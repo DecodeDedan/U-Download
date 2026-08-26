@@ -1,0 +1,13 @@
+name: smoke
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prove a runner was allocated
+        run: |
+          echo "runner allocated"
+          uname -a
