@@ -311,9 +311,9 @@ checksum_source() {
     ffmpeg)
       case "$PLATFORM" in
         linux-x64)
-          echo "md5:https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz.md5" ;;
+          echo "sha256:https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/checksums.sha256" ;;
         linux-arm64)
-          echo "md5:https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz.md5" ;;
+          echo "sha256:https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/checksums.sha256" ;;
         windows-x64)
           echo "sha256:https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/checksums.sha256" ;;
         *)
@@ -430,8 +430,8 @@ yt_dlp_url() {
 
 ffmpeg_url() {
   case "$PLATFORM" in
-    linux-x64)   echo "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" ;;
-    linux-arm64) echo "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz" ;;
+    linux-x64)   echo "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz" ;;
+    linux-arm64) echo "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linuxarm64-gpl.tar.xz" ;;
     macos-x64)   echo "https://ffmpeg.martin-riedl.de/redirect/latest/macos/amd64/release/ffmpeg.zip" ;;
     macos-arm64) echo "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip" ;;
     windows-x64) echo "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip" ;;
