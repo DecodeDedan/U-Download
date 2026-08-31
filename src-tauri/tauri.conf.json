@@ -52,14 +52,15 @@
       "binaries/**/*"
     ],
     "externalBin": [],
-    "copyright": "Copyright © 2025 U-Download. All rights reserved.",
+    "copyright": "Copyright \u00a9 2025 U-Download. All rights reserved.",
     "category": "Utility",
     "shortDescription": "Fast YouTube downloader",
     "longDescription": "U-Download is a beautiful, cross-platform YouTube downloader powered by yt-dlp and aria2c for maximum download speed and reliability.",
     "macOS": {
       "frameworks": [],
       "minimumSystemVersion": "10.15",
-      "exceptionDomain": ""
+      "exceptionDomain": "",
+      "signingIdentity": "-"
     },
     "windows": {
       "certificateThumbprint": null,
