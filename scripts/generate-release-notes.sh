@@ -88,6 +88,14 @@ done <<< "$COMMITS"
   echo "- Windows: NSIS .exe installer"
   echo "- macOS: .dmg (Intel and Apple Silicon)"
   echo
+  echo "macOS: install from Terminal to avoid the \"could not verify ... free of malware\" prompt:"
+  echo
+  echo '```bash'
+  echo "curl -fsSL https://raw.githubusercontent.com/DecodeDedan/U-Download/main/scripts/install-macos.sh | bash"
+  echo '```'
+  echo
+  echo "Installed copies update themselves on launch."
+  echo
   echo "Assets are attached to this release."
 } > "$OUT_FILE"
 

@@ -42,11 +42,22 @@ sudo rpm -i U-Download-*.x86_64.rpm
 3. Launch from Start Menu
 
 #### macOS
-1. Download `U-Download_*.dmg`
-2. Open DMG and drag to Applications
-3. **First launch**: Right-click → Open (to bypass unsigned app warning)
+Paste this into Terminal (Intel and Apple Silicon, picks the right build):
 
-> **Note**: Binaries aren't codesigned. On macOS, allow the app in System Settings → Privacy & Security if prompted.
+```bash
+curl -fsSL https://raw.githubusercontent.com/DecodeDedan/U-Download/main/scripts/install-macos.sh | bash
+```
+
+It downloads the latest DMG, checks it against the sha256 GitHub publishes, and
+copies U-Download into Applications ([script](scripts/install-macos.sh)). After
+that the app updates itself.
+
+> **Why not just the DMG?** U-Download is not notarized by Apple. A DMG opened
+> from a browser download is flagged as "downloaded from the internet", and
+> macOS then refuses it with "Apple could not verify U-Download is free of
+> malware". Files fetched with `curl` do not get that flag. If you already
+> downloaded the DMG in a browser, drag it to Applications, try to open it once,
+> then go to System Settings → Privacy & Security and click **Open Anyway**.
 
 ## ✨ Features
 
@@ -127,10 +138,10 @@ cd ~/Downloads/
 ./U-Download_*.AppImage
 ```
 
-**macOS: "App can't be opened because it's from an unidentified developer"**
-1. Right-click the app → Open
-2. Click "Open" in the dialog
-3. Or go to System Settings → Privacy & Security → Allow app
+**macOS: "Apple could not verify U-Download is free of malware" / "Move to Bin"**
+1. Click **Done**, not Move to Bin
+2. Go to System Settings → Privacy & Security and click **Open Anyway**
+3. Or reinstall with the Terminal command under [macOS](#macos), which avoids the prompt
 
 **Windows: "Windows protected your PC" warning**
 1. Click "More info"
