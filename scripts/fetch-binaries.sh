@@ -325,11 +325,8 @@ checksum_source() {
       esac
       ;;
     aria2c)
-      # None of abcfy2/aria2-static-build (linux, windows) or
-      # q741451/aria2c-macos-standalone-binary (macos) publish a checksum
-      # file alongside their release assets. Confirmed by inspecting their
-      # release asset lists — no .sha256/.md5/checksums file present.
-      echo ""
+      # motrixapp/aria2 publishes SHA256SUMS covering every release archive.
+      echo "sha256:$ARIA2C_BASE/SHA256SUMS"
       ;;
     cacert.pem)
       # curl.se publishes a sha256 for the CA bundle right beside it, in
@@ -438,13 +435,21 @@ ffmpeg_url() {
   esac
 }
 
+# aria2c is Motrix's build of aria2 (motrixapp/aria2): the engine Motrix ships,
+# built for all five platforms, depending only on system libraries, with a
+# SHA256SUMS file covering every archive. Pinned to a tag rather than
+# "latest" so a new fork release can never change the engine unreviewed.
+ARIA2C_TAG="v1.37.0-motrix.16"
+ARIA2C_BASE="https://github.com/motrixapp/aria2/releases/download/$ARIA2C_TAG"
+
 aria2c_url() {
+  local v="${ARIA2C_TAG#v}"
   case "$PLATFORM" in
-    linux-x64)   echo "https://github.com/abcfy2/aria2-static-build/releases/latest/download/aria2-x86_64-linux-musl_static.zip" ;;
-    linux-arm64) echo "https://github.com/abcfy2/aria2-static-build/releases/latest/download/aria2-aarch64-linux-musl_static.zip" ;;
-    macos-x64)   echo "https://github.com/q741451/aria2c-macos-standalone-binary/releases/latest/download/aria2c-macos-x86_64.tar.gz" ;;
-    macos-arm64) echo "https://github.com/q741451/aria2c-macos-standalone-binary/releases/latest/download/aria2c-macos-arm64.tar.gz" ;;
-    windows-x64) echo "https://github.com/abcfy2/aria2-static-build/releases/latest/download/aria2-x86_64-w64-mingw32_static.zip" ;;
+    linux-x64)   echo "$ARIA2C_BASE/aria2c-$v-linux-x64.tar.gz" ;;
+    linux-arm64) echo "$ARIA2C_BASE/aria2c-$v-linux-arm64.tar.gz" ;;
+    macos-x64)   echo "$ARIA2C_BASE/aria2c-$v-darwin-x64.tar.gz" ;;
+    macos-arm64) echo "$ARIA2C_BASE/aria2c-$v-darwin-arm64.tar.gz" ;;
+    windows-x64) echo "$ARIA2C_BASE/aria2c-$v-win32-x64.zip" ;;
   esac
 }
 

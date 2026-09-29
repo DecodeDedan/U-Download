@@ -26,14 +26,43 @@ pub struct DownloadSpec {
     pub format: FormatChoice,
     pub trim: Option<TrimRange>,
     pub output_template: String,
-    pub concurrency: u32,
 }
 
-/// aria2c splits the link N ways per download. As more downloads run at once,
-/// each gets proportionally fewer connections so the link is not saturated.
-pub fn aria2c_connections(concurrency: u32) -> u32 {
-    let c = concurrency.max(1);
-    (16 / c).clamp(4, 16)
+/// aria2c tuning, taken from Motrix's default ("auto") engine profile.
+///
+/// Speed comes from splitting one file across 16 parallel ranged connections:
+/// YouTube and most CDNs cap throughput per connection, not per client. Every
+/// download gets all 16 whatever the queue concurrency; yt-dlp itself already
+/// asks for 16 (`-x16 -s16`) and aria2 honours a flag's last occurrence, so a
+/// smaller value here would only slow the download down. 16 is also the most
+/// upstream aria2 accepts per server, so this works with any aria2c build.
+///
+/// The rest keeps those connections busy: a 32M write cache instead of 16
+/// streams of small disk writes, and dead connections dropped and retried
+/// after 30s instead of aria2's 60s default.
+const ARIA2C_ARGS: &str = "--split=16 --max-connection-per-server=16 --min-split-size=1M \
+     --disk-cache=32M --connect-timeout=30 --timeout=30 --max-tries=5 --retry-wait=10";
+
+/// Fragments of an HLS/DASH stream fetched at once. yt-dlp never hands
+/// fragments to aria2c, so this is the parallelism those sites get.
+const CONCURRENT_FRAGMENTS: &str = "16";
+
+const YOUTUBE_HOSTS: [&str; 3] = ["youtube.com", "youtu.be", "youtube-nocookie.com"];
+
+/// YouTube is the one site where aria2c loses. It throttles a plain ranged
+/// connection (measured: ~90KB/s each, 940KiB/s across 16), but not the
+/// `&range=` chunked requests yt-dlp's own downloader makes (7.9MiB/s on the
+/// same stream), so YouTube stays on yt-dlp's downloader.
+fn is_youtube(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    YOUTUBE_HOSTS
+        .iter()
+        .any(|yt| host == *yt || host.ends_with(&format!(".{yt}")))
 }
 
 /// Builds the full yt-dlp argument vector for one job.
@@ -74,11 +103,14 @@ pub fn build_download_args(
     // An external downloader cannot serve ranged section requests, so trimmed
     // jobs fall back to yt-dlp's native ranged fetch.
     if !trimming {
-        let conns = aria2c_connections(spec.concurrency);
+        args.push("--concurrent-fragments".into());
+        args.push(CONCURRENT_FRAGMENTS.into());
+    }
+    if !trimming && !is_youtube(&spec.url) {
         args.push("--external-downloader".into());
         args.push("aria2c".into());
         args.push("--external-downloader-args".into());
-        args.push(format!("-x {} -s {} -k 1M", conns, conns));
+        args.push(ARIA2C_ARGS.into());
     }
 
     match &spec.format {
@@ -469,7 +501,6 @@ mod tests {
             format: FormatChoice::Quick { kind: MediaKind::Mp4, height: Some(720) },
             trim,
             output_template: "/out/%(title)s.%(ext)s".to_string(),
-            concurrency: 1,
         }
     }
 
@@ -554,12 +585,93 @@ mod tests {
         assert!(joined(&args).contains("bestvideo[height<=720]+bestaudio/best[height<=720]"));
     }
 
+    fn aria2c_args(args: &[String]) -> &str {
+        let at = index_of(args, "--external-downloader-args");
+        &args[at + 1]
+    }
+
     #[test]
-    fn aria2c_connections_scale_down_as_concurrency_rises() {
-        assert_eq!(aria2c_connections(1), 16);
-        assert_eq!(aria2c_connections(2), 8);
-        assert_eq!(aria2c_connections(4), 4);
-        assert_eq!(aria2c_connections(5), 4); // clamped at the floor
+    fn untrimmed_job_opens_sixteen_connections() {
+        let args = build_download_args(&spec_with_trim(None), "/bin/ffmpeg", None);
+        let aria2 = aria2c_args(&args);
+        assert!(aria2.contains("--split=16"), "{aria2}");
+        assert!(aria2.contains("--max-connection-per-server=16"), "{aria2}");
+        assert!(aria2.contains("--min-split-size=1M"), "{aria2}");
+    }
+
+    // yt-dlp already passes -x16 -s16 to aria2c, and aria2 honours the last
+    // occurrence of a flag: anything below 16 here slows every download.
+    #[test]
+    fn aria2c_arguments_never_drop_below_ytdlp_defaults() {
+        let args = build_download_args(&spec_with_trim(None), "/bin/ffmpeg", None);
+        let aria2 = aria2c_args(&args);
+        for token in aria2.split_whitespace() {
+            for flag in ["--split=", "--max-connection-per-server="] {
+                if let Some(n) = token.strip_prefix(flag) {
+                    assert!(n.parse::<u32>().unwrap() >= 16, "{token} in {aria2}");
+                }
+            }
+        }
+    }
+
+    fn spec_for(url: &str) -> DownloadSpec {
+        DownloadSpec { url: url.to_string(), ..spec_with_trim(None) }
+    }
+
+    // Measured: YouTube throttled one stream to ~90KB/s per connection and
+    // aria2c's 16 ranged connections reached 940KiB/s, while yt-dlp's own
+    // downloader (which requests `&range=` chunks) pulled 7.9MiB/s.
+    #[test]
+    fn youtube_uses_ytdlp_native_downloader_not_aria2c() {
+        for url in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://m.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ",
+            "https://YOUTUBE.com/shorts/abc",
+        ] {
+            let args = build_download_args(&spec_for(url), "/bin/ffmpeg", None);
+            assert!(!args.contains(&"--external-downloader".to_string()), "{url}");
+        }
+    }
+
+    #[test]
+    fn lookalike_hosts_are_not_treated_as_youtube() {
+        for url in [
+            "https://notyoutube.com/watch?v=x",
+            "https://youtube.com.evil.example/watch?v=x",
+            "https://vimeo.com/76979871",
+            "not a url",
+        ] {
+            let args = build_download_args(&spec_for(url), "/bin/ffmpeg", None);
+            assert!(args.contains(&"--external-downloader".to_string()), "{url}");
+        }
+    }
+
+    // HLS/DASH fragments are never handed to aria2c; -N is what parallelises
+    // them, on every site.
+    #[test]
+    fn untrimmed_jobs_fetch_sixteen_fragments_at_once() {
+        for url in ["https://www.youtube.com/watch?v=x", "https://vimeo.com/76979871"] {
+            let args = build_download_args(&spec_for(url), "/bin/ffmpeg", None);
+            assert_eq!(args[index_of(&args, "--concurrent-fragments") + 1], "16", "{url}");
+        }
+    }
+
+    #[test]
+    fn aria2c_gets_motrix_io_and_recovery_tuning() {
+        let args = build_download_args(&spec_with_trim(None), "/bin/ffmpeg", None);
+        let aria2 = aria2c_args(&args);
+        for flag in [
+            "--disk-cache=32M",
+            "--connect-timeout=30",
+            "--timeout=30",
+            "--max-tries=5",
+            "--retry-wait=10",
+        ] {
+            assert!(aria2.contains(flag), "missing {flag} in {aria2}");
+        }
     }
 
     // Proves the element-based stream-copy guard actually catches what the

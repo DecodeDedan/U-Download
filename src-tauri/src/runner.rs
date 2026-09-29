@@ -230,7 +230,6 @@ pub fn run_job<R: Runtime>(window: Window<R>, jobs: SharedJobs, id: JobId, ctx: 
         format: job.format.clone(),
         trim: job.trim,
         output_template: format!("{}/%(title)s.%(ext)s", job.output_folder),
-        concurrency: ctx.concurrency,
     };
 
     // Trimming lives entirely in these arguments (`--download-sections` plus
