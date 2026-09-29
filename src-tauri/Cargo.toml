@@ -45,3 +45,9 @@ uuid = { version = "1.25.0", features = ["v4"] }
 # worker running. See `src/proc.rs`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Self-update from GitHub Releases. Desktop only: an APK cannot replace itself.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"
+# Relaunches the app once an update is installed.
+tauri-plugin-process = "2"

@@ -70,6 +70,11 @@ ehthumbs.db
 scripts/*
 # ...but the build-time binary fetcher must be tracked
 !scripts/fetch-binaries.sh
+# ...and the updater manifest builder (release.yml) and the macOS installer
+# (linked from the README by raw URL)
+!scripts/updater-manifest.mjs
+!scripts/updater-manifest.test.js
+!scripts/install-macos.sh
 *.ps1
 
 

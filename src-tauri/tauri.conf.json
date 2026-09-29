@@ -73,7 +73,18 @@
         "section": "video",
         "priority": "optional"
       }
-    }
+    },
+    "createUpdaterArtifacts": true
   },
-  "plugins": {}
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNCQkY1RjkwMTQ3MzQxNjAKUldSZ1FYTVVrRisvTzF3a1BrQUF4djVMYllUNlYxMFIxcG1pc1Z0RS9FWXlXOCsvb1JFeFhrQzIK",
+      "endpoints": [
+        "https://github.com/DecodeDedan/U-Download/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
 }

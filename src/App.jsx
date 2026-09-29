@@ -5,6 +5,7 @@ import { downloadDir, videoDir, join, dirname } from "@tauri-apps/api/path";
 import { isPermissionGranted as notifGranted, requestPermission as notifRequest, sendNotification } from "@tauri-apps/plugin-notification";
 import { useJobs } from "./hooks/useJobs";
 import { useSpeedHistory } from "./hooks/useSpeedHistory";
+import { useAppUpdate } from "./hooks/useAppUpdate";
 import TrimWorkbench from "./components/TrimWorkbench";
 import QueueItem from "./components/QueueItem";
 import { formatTime } from "./lib/time";
@@ -316,6 +317,7 @@ function App() {
         : null;
 
   const activeCount = jobs.filter((j) => !['done', 'failed', 'cancelled'].includes(j.status)).length;
+  const update = useAppUpdate({ enabled: !isAndroid && !import.meta.env.DEV, busy: activeCount > 0 });
 
   return (
     <div className="flex h-full flex-col bg-canvas font-sans text-fg antialiased">
@@ -339,6 +341,31 @@ function App() {
           </button>
         </div>
       </header>
+
+      {update.phase !== 'idle' && (
+        <div role="status" className="flex shrink-0 items-center gap-3 border-b border-hair px-4 py-1.5 text-meta">
+          <span className="min-w-0 flex-1 truncate">
+            {update.phase === 'downloading' &&
+              `Downloading U-Download ${update.version}${update.percent === null ? '' : ` (${update.percent}%)`}`}
+            {update.phase === 'ready' &&
+              `U-Download ${update.version} is ready. It installs when your downloads finish.`}
+            {update.phase === 'installing' && `Installing U-Download ${update.version}. The app restarts by itself.`}
+          </span>
+          {update.phase === 'ready' && (
+            <button type="button" onClick={update.installNow} className="btn btn-sm btn-secondary">
+              Restart now
+            </button>
+          )}
+        </div>
+      )}
+      {update.error && (
+        <div role="alert" className="flex shrink-0 items-center gap-3 border-b border-hair px-4 py-1.5 text-meta text-danger">
+          <span className="min-w-0 flex-1 truncate">{update.error} It will retry at the next check.</span>
+          <button type="button" onClick={update.dismissError} className="btn btn-sm btn-quiet">
+            Dismiss
+          </button>
+        </div>
+      )}
 
       <main className="grid min-h-0 flex-1 grid-cols-1 overflow-y-auto md:grid-cols-[minmax(0,1fr)_24rem] md:grid-rows-1 md:overflow-hidden">
         {/* ---- Left: everything that describes the download ---------------- */}

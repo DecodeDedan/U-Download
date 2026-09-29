@@ -97,8 +97,45 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signs the updater bundles (.app.tar.gz, .AppImage, -setup.exe) so
+          # installed copies accept them; see plugins.updater.pubkey.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           releaseId: ${{ needs.prepare.outputs.release_id }}
           args: ${{ matrix.args }}
           releaseDraft: true
           tauriScript: npm run tauri
+          # The publish job writes latest.json once, after every platform.
+          uploadUpdaterJson: false
+
+  # Installed copies poll releases/latest/download/latest.json, which a draft
+  # never serves. Publishing only after every build succeeded means an update
+  # is never offered for a platform whose installer is missing.
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.prepare.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Build latest.json from the uploaded signatures
+        run: |
+          mkdir -p sigs
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sig' --dir sigs
+          TAG="$TAG" scripts/generate-release-notes.sh NOTES.md
+          node scripts/updater-manifest.mjs sigs "$TAG" \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG" NOTES.md latest.json
+
+      - name: Upload latest.json and publish the release
+        run: |
+          gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

@@ -453,6 +453,12 @@ pub fn run() {
         .manage(concurrency_state)
         .manage(metadata_cache);
 
+    // Self-update, verified against the minisign public key in tauri.conf.json.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = builder
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init());
+
     // Android is still served by the legacy single-download command and its
     // global progress state; the desktop path is the job queue alone. The two
     // command lists are spelled out separately because `generate_handler!`
