@@ -107,7 +107,7 @@ jobs:
           releaseDraft: true
           tauriScript: npm run tauri
           # The publish job writes latest.json once, after every platform.
-          uploadUpdaterJson: false
+          includeUpdaterJson: false
 
   # Installed copies poll releases/latest/download/latest.json, which a draft
   # never serves. Publishing only after every build succeeded means an update
