@@ -81,6 +81,9 @@ function App() {
   useEffect(() => {
     localStorage.setItem("concurrency", String(concurrency));
   }, [concurrency]);
+  // Set when the Android download engine fails to start, so the UI says so
+  // instead of waiting on "Preparing…" forever.
+  const [engineError, setEngineError] = useState(null);
   const [url, setUrl] = useState("");
   const [downloadType, setDownloadType] = useState("mp4");
   const [quality, setQuality] = useState("best");
@@ -206,8 +209,14 @@ function App() {
     // Every Android download lands in the one shared folder the engine can
     // write to; a folder remembered from an older build is replaced.
     invoke('get_android_videos_dir')
-      .then((dir) => setOutputFolder(dir))
-      .catch((error) => console.error('Download engine did not start:', error));
+      .then((dir) => {
+        setEngineError(null);
+        setOutputFolder(dir);
+      })
+      .catch((error) => {
+        console.error('Download engine did not start:', error);
+        setEngineError(String(error));
+      });
 
     return () => {
       disposed = true;
@@ -387,15 +396,18 @@ function App() {
 
   // One sentence that names what is missing and what to do about it, in place
   // of a checklist of ticks.
-  const blockingHint = !url
-    ? "Paste a video link to begin."
-    : !urlIsValid
-      ? "The link must start with http:// or https://."
-      : !outputFolder
-        ? (isAndroid
-          ? "Preparing the download engine. This takes a few seconds on first launch."
-          : "Choose a folder to save into.")
-        : null;
+  // A broken engine outranks everything else: no link can fix it.
+  const blockingHint = isAndroid && engineError
+    ? `The download engine could not start: ${engineError}. Restart the app, or report this from the menu.`
+    : !url
+      ? "Paste a video link to begin."
+      : !urlIsValid
+        ? "The link must start with http:// or https://."
+        : !outputFolder
+          ? (isAndroid
+            ? "Preparing the download engine. This takes a few seconds on first launch."
+            : "Choose a folder to save into.")
+          : null;
 
   const activeCount = jobs.filter((j) => !['done', 'failed', 'cancelled'].includes(j.status)).length;
   const update = useAppUpdate({ enabled: !isAndroid && !import.meta.env.DEV, busy: activeCount > 0 });
