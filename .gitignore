@@ -25,7 +25,10 @@ dist-ssr
 
 # Tauri
 src-tauri/target
-src-tauri/gen
+src-tauri/gen/*
+# The Android project is hand-edited (share intent, packaging, signing), so it
+# is tracked; tauri regenerates only the ignored files inside it.
+!src-tauri/gen/android
 
 # Bundled tool binaries (yt-dlp, ffmpeg, aria2c) are fetched at build time
 # by scripts/fetch-binaries.sh rather than stored in Git/Git LFS.

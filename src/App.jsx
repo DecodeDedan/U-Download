@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { downloadDir, videoDir, join, dirname } from "@tauri-apps/api/path";
 import { isPermissionGranted as notifGranted, requestPermission as notifRequest, sendNotification } from "@tauri-apps/plugin-notification";
 import { useJobs } from "./hooks/useJobs";
@@ -8,6 +9,7 @@ import { useSpeedHistory } from "./hooks/useSpeedHistory";
 import { useAppUpdate } from "./hooks/useAppUpdate";
 import TrimWorkbench from "./components/TrimWorkbench";
 import QueueItem from "./components/QueueItem";
+import Splash from "./components/Splash";
 import { formatTime } from "./lib/time";
 import soundNotifications from "./SoundNotifications";
 import {
@@ -17,13 +19,20 @@ import {
   IconMoon,
   IconQueue,
   IconScissors,
+  IconMenu,
   IconSun,
 } from "./components/icons";
+import Sidebar, { openExternal } from "./components/Sidebar";
+import { AboutPage, GuidePage, SettingsPage } from "./components/MobilePages";
+import { useMobileUpdate } from "./hooks/useMobileUpdate";
+import { APK_DOWNLOAD_URL } from "./lib/mobileRelease";
 import "./App.css";
 
 // yt-dlp supports 1000+ sites; the extractor decides what is downloadable, and
 // reports back through the normal job error path. This only rejects input that
 // is not a URL at all.
+const ENGINE_UPDATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+
 const isValidUrl = (value) => {
   try {
     const parsed = new URL(String(value).trim());
@@ -35,6 +44,43 @@ const isValidUrl = (value) => {
 
 function App() {
   const isAndroid = typeof navigator !== 'undefined' && /android/i.test(navigator.userAgent);
+  // The mobile app opens on a splash; desktop launches straight into work.
+  const [showSplash, setShowSplash] = useState(isAndroid);
+  const hideSplash = useCallback(() => setShowSplash(false), []);
+
+  // Mobile navigation: the sidebar and the page it opened. Each is a history
+  // entry, so Android's Back button closes them instead of leaving the app.
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [view, setView] = useState("home");
+  useEffect(() => {
+    if (!isAndroid) return undefined;
+    const onPop = (event) => {
+      setMenuOpen(false);
+      setView(event.state?.udl === "page" ? event.state.view : "home");
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, [isAndroid]);
+  const openMenu = () => {
+    window.history.pushState({ udl: "menu" }, "");
+    setMenuOpen(true);
+  };
+  const closeMenu = useCallback(() => window.history.back(), []);
+  // The menu's own history entry becomes the page's, so Back from a page
+  // returns to wherever the menu was opened from.
+  const navigate = (id) => {
+    window.history.replaceState(id === "home" ? null : { udl: "page", view: id }, "");
+    setMenuOpen(false);
+    setView(id);
+  };
+
+  const [concurrency, setConcurrency] = useState(() => {
+    const saved = Number(localStorage.getItem("concurrency"));
+    return Number.isInteger(saved) && saved >= 1 && saved <= 3 ? saved : 2;
+  });
+  useEffect(() => {
+    localStorage.setItem("concurrency", String(concurrency));
+  }, [concurrency]);
   const [url, setUrl] = useState("");
   const [downloadType, setDownloadType] = useState("mp4");
   const [quality, setQuality] = useState("best");
@@ -125,42 +171,64 @@ function App() {
     })();
   }, []);
 
-  // Initialize Android defaults: set Videos dir and capture share intents
+  // Android: links shared from YouTube (or any app) land in the link field.
+  // A share that launched the app is pulled once; shares that arrive while
+  // it is open come in as `shared-url` events.
   useEffect(() => {
+    if (!isAndroid) return undefined;
+    let unlisten = null;
+    let disposed = false;
+    const acceptShared = (shared) => {
+      if (isValidUrl(shared)) setUrl(shared);
+    };
+
+    listen('shared-url', (event) => acceptShared(event.payload))
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch((error) => console.error('Could not listen for shared links:', error));
+
+    invoke('get_shared_url')
+      .then(acceptShared)
+      .catch(() => { /* "empty": nothing was shared at launch */ });
+
+    // The yt-dlp bundled in the APK ages from the day it ships, and YouTube
+    // breaks old versions within weeks, so it is refreshed in the background
+    // once a week. Failure is harmless: the next launch tries again.
+    const lastEngineUpdate = Number(localStorage.getItem("engineUpdatedAt")) || 0;
+    if (Date.now() - lastEngineUpdate > ENGINE_UPDATE_INTERVAL_MS) {
+      invoke('update_engine')
+        .then(() => localStorage.setItem("engineUpdatedAt", String(Date.now())))
+        .catch((error) => console.error('Background yt-dlp update failed:', error));
+    }
+
+    // Every Android download lands in the one shared folder the engine can
+    // write to; a folder remembered from an older build is replaced.
+    invoke('get_android_videos_dir')
+      .then((dir) => setOutputFolder(dir))
+      .catch((error) => console.error('Download engine did not start:', error));
+
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Desktop: default to the system Videos folder until the user picks one.
+  useEffect(() => {
+    if (isAndroid || localStorage.getItem("outputFolder")) return;
     (async () => {
       try {
-        // Default output folder
-        let vdir = null;
-        try { vdir = await videoDir(); } catch (_) {}
-        if (!vdir) {
-          try { vdir = await invoke('get_android_videos_dir'); } catch (_) {}
-        }
-        if (!vdir) {
-          try {
-            const ddir = await downloadDir();
-            const parent = await dirname(ddir);
-            vdir = await join(parent, 'Movies');
-          } catch (_) {}
-        }
-        if (vdir && !outputFolder) {
-          setOutputFolder(vdir);
-          localStorage.setItem("outputFolder", vdir);
-        }
-
-        // Android Share intent via native bridge (file-based)
+        setOutputFolder(await videoDir());
+      } catch {
         try {
-          const shared = await invoke('get_shared_url');
-          if (shared && isValidUrl(shared)) {
-            setUrl(shared);
-          }
-        } catch {}
-
-        // Notification permission
-        try {
-          const granted = await notifGranted();
-          if (!granted) await notifRequest();
-        } catch {}
-      } catch {}
+          setOutputFolder(await join(await dirname(await downloadDir()), 'Movies'));
+        } catch (error) {
+          console.error('No default download folder:', error);
+        }
+      }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -170,7 +238,7 @@ function App() {
     const savedType = localStorage.getItem("downloadType");
     const savedQuality = localStorage.getItem("quality");
 
-    if (savedFolder) setOutputFolder(savedFolder);
+    if (savedFolder && !isAndroid) setOutputFolder(savedFolder);
     if (savedType) setDownloadType(savedType);
     if (savedQuality) setQuality(savedQuality);
   }, []);
@@ -183,7 +251,7 @@ function App() {
 
   const selectOutputFolder = async () => {
     if (isAndroid) {
-      alert('On Android, U-Download saves to the Videos folder by default.');
+      alert('On Android, downloads are saved to Download/U-Download.');
       return;
     }
     setIsSelectingFolder(true);
@@ -226,12 +294,12 @@ function App() {
     if (!folder) {
       if (isAndroid) {
         try {
-          const vdir = await videoDir();
-          if (vdir) {
-            folder = vdir;
-            setOutputFolder(vdir);
-          }
-        } catch {}
+          folder = await invoke('get_android_videos_dir');
+          setOutputFolder(folder);
+        } catch (error) {
+          alert(`The download engine is not ready: ${error}`);
+          return;
+        }
       }
       if (!folder) {
         alert("Please select an output folder");
@@ -254,6 +322,16 @@ function App() {
       }
     }
 
+    // Asked at the first download, where the reason is obvious, rather than
+    // over the launch splash. A refusal only loses the progress notification.
+    if (isAndroid) {
+      try {
+        if (!(await notifGranted())) await notifRequest();
+      } catch (error) {
+        console.error('Notification permission check failed:', error);
+      }
+    }
+
     try {
       await enqueue({
         url,
@@ -262,6 +340,7 @@ function App() {
           : { mode: 'quick', kind: 'mp4', height: quality === 'best' ? null : Number(quality) },
         trim,
         outputFolder: folder,
+        concurrency,
       });
     } catch (error) {
       console.error("Could not queue download:", error);
@@ -313,23 +392,51 @@ function App() {
     : !urlIsValid
       ? "The link must start with http:// or https://."
       : !outputFolder
-        ? "Choose a folder to save into."
+        ? (isAndroid
+          ? "Preparing the download engine. This takes a few seconds on first launch."
+          : "Choose a folder to save into.")
         : null;
 
   const activeCount = jobs.filter((j) => !['done', 'failed', 'cancelled'].includes(j.status)).length;
   const update = useAppUpdate({ enabled: !isAndroid && !import.meta.env.DEV, busy: activeCount > 0 });
+  const mobileUpdate = useMobileUpdate({ enabled: isAndroid && !import.meta.env.DEV, currentVersion: appVersion });
 
   return (
     <div className="flex h-full flex-col bg-canvas font-sans text-fg antialiased">
+      {showSplash && <Splash onDone={hideSplash} />}
+      {isAndroid && (
+        <Sidebar
+          open={menuOpen}
+          onClose={closeMenu}
+          view={view}
+          onNavigate={navigate}
+          appVersion={appVersion}
+          update={mobileUpdate}
+        />
+      )}
       <header className="flex h-11 shrink-0 items-center gap-2.5 border-b border-hair px-4">
+        {isAndroid && (
+          <button
+            type="button"
+            onClick={openMenu}
+            className="icon-btn -ml-2"
+            aria-label="Open menu"
+            aria-expanded={menuOpen}
+          >
+            <IconMenu size={20} />
+          </button>
+        )}
         <img src="/logo.png" alt="" className="h-5 w-5 shrink-0 object-contain" />
         <h1 className="text-ui font-semibold tracking-[-0.01em]">U-Download</h1>
         <span className="tnum text-micro text-fg-muted">{appVersion || 'dev'}</span>
 
         <div className="ml-auto flex items-center gap-1">
-          <button type="button" onClick={testDependencies} className="btn btn-sm btn-quiet">
-            Diagnostics
-          </button>
+          {/* Android shows the same report under About. */}
+          {!isAndroid && (
+            <button type="button" onClick={testDependencies} className="btn btn-sm btn-quiet">
+              Diagnostics
+            </button>
+          )}
           <button
             type="button"
             onClick={toggleTheme}
@@ -358,6 +465,14 @@ function App() {
           )}
         </div>
       )}
+      {mobileUpdate.status === 'available' && mobileUpdate.latest && (
+        <div role="status" className="flex shrink-0 items-center gap-3 border-b border-hair px-4 py-1.5 text-meta">
+          <span className="min-w-0 flex-1 truncate">U-Download {mobileUpdate.latest.version} is available.</span>
+          <button type="button" onClick={() => openExternal(APK_DOWNLOAD_URL)} className="btn btn-sm btn-secondary">
+            Download
+          </button>
+        </div>
+      )}
       {update.error && (
         <div role="alert" className="flex shrink-0 items-center gap-3 border-b border-hair px-4 py-1.5 text-meta text-danger">
           <span className="min-w-0 flex-1 truncate">{update.error} It will retry at the next check.</span>
@@ -367,9 +482,31 @@ function App() {
         </div>
       )}
 
-      <main className="grid min-h-0 flex-1 grid-cols-1 overflow-y-auto md:grid-cols-[minmax(0,1fr)_24rem] md:grid-rows-1 md:overflow-hidden">
+      {isAndroid && view !== 'home' && (
+        <main className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+          {view === 'settings' && (
+            <SettingsPage
+              downloadType={downloadType}
+              onDownloadType={setDownloadType}
+              quality={quality}
+              onQuality={setQuality}
+              concurrency={concurrency}
+              onConcurrency={setConcurrency}
+              isDarkMode={isDarkMode}
+              onDarkMode={setIsDarkMode}
+            />
+          )}
+          {view === 'guide' && <GuidePage />}
+          {view === 'about' && <AboutPage appVersion={appVersion} />}
+        </main>
+      )}
+      {/* Hidden rather than unmounted while another page shows, so a link and
+          an open preview survive a trip to Settings. */}
+      <main className={`${view === 'home' ? 'grid' : 'hidden'} min-h-0 flex-1 auto-rows-max grid-cols-1 overflow-y-auto overscroll-contain md:grid-cols-[minmax(0,1fr)_24rem] md:grid-rows-1 md:overflow-hidden`}>
         {/* ---- Left: everything that describes the download ---------------- */}
-        <section className="flex min-h-0 min-w-0 flex-col">
+        {/* Shrink-to-fit only in the two-pane layout; stacked on a phone, each
+            section takes its content height and the page scrolls. */}
+        <section className="flex min-w-0 flex-col md:min-h-0">
           <div className="px-5 pb-4 pt-4">
             <label htmlFor="video-url" className="label-region">Video link</label>
             <input
@@ -392,7 +529,7 @@ function App() {
           {showTrim ? (
             <TrimWorkbench url={url} onChange={setTrim} onClose={() => setShowTrim(false)} />
           ) : (
-            <div className="flex min-h-0 flex-1 flex-col">
+            <div className="flex flex-1 flex-col md:min-h-0">
               <div className="flex items-center gap-3 px-5 pb-2">
                 <span className="label-region shrink-0">Preview</span>
                 <p className="min-w-0 flex-1 truncate text-meta text-fg-muted">Not open</p>
@@ -456,17 +593,22 @@ function App() {
               >
                 <IconFolder size={16} className="shrink-0 text-fg-muted" />
                 <span className={`truncate text-ui ${outputFolder ? '' : 'text-fg-muted'}`}>
-                  {outputFolder || 'No folder chosen yet'}
+                  {isAndroid
+                    ? (outputFolder ? 'Download/U-Download' : 'Preparing the download engine…')
+                    : outputFolder || 'No folder chosen yet'}
                 </span>
               </div>
-              <button
-                type="button"
-                onClick={selectOutputFolder}
-                disabled={isSelectingFolder}
-                className="btn btn-secondary shrink-0"
-              >
-                {isSelectingFolder ? 'Opening' : outputFolder ? 'Change' : 'Choose'}
-              </button>
+              {/* Android's folder picker returns content:// URIs that yt-dlp cannot write to. */}
+              {!isAndroid && (
+                <button
+                  type="button"
+                  onClick={selectOutputFolder}
+                  disabled={isSelectingFolder}
+                  className="btn btn-secondary shrink-0"
+                >
+                  {isSelectingFolder ? 'Opening' : outputFolder ? 'Change' : 'Choose'}
+                </button>
+              )}
             </div>
           </div>
 
@@ -489,7 +631,7 @@ function App() {
         </section>
 
         {/* ---- Right: the queue, the only region that scrolls -------------- */}
-        <aside className="flex min-h-0 flex-col border-t border-hair md:border-l md:border-t-0">
+        <aside className="flex flex-col border-t border-hair md:min-h-0 md:border-l md:border-t-0">
           <div className="flex h-10 shrink-0 items-center gap-3 border-b border-hair px-4">
             <span className="label-region">Queue</span>
             {jobs.length > 0 && (
@@ -499,7 +641,7 @@ function App() {
             )}
           </div>
 
-          <div className="scroll-quiet min-h-0 flex-1 overflow-y-auto">
+          <div className="scroll-quiet flex-1 md:min-h-0 md:overflow-y-auto">
             {jobs.length === 0 ? (
               <div className="flex h-full min-h-[12rem] flex-col items-center justify-center gap-2.5 px-8 text-center">
                 <IconQueue size={22} className="text-fg-muted" />

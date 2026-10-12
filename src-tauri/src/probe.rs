@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 use tauri::{AppHandle, Runtime, State};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,37 +404,14 @@ pub fn pick_preview_format(
 /// `metadata_cache::get_or_probe`, which runs it at most once per URL and makes
 /// a second caller for a URL already being probed wait on the first rather than
 /// start its own.
-fn dump_single_json(
-    yt_dlp: &std::path::Path,
-    binaries_dir: &std::path::Path,
-    js_runtime: Option<&crate::binary_manager::JsRuntime>,
-    url: &str,
-) -> Result<serde_json::Value, String> {
-    let mut args: Vec<String> = Vec::new();
-    crate::binary_manager::push_js_runtime_args(&mut args, js_runtime);
-    let mut cmd = Command::new(yt_dlp);
-    // Puts the bundled tools on PATH and, crucially, SSL_CERT_FILE in the
-    // environment: yt-dlp may reach for ffmpeg here, and the bundled
-    // ffmpeg cannot verify a single HTTPS certificate without it.
-    crate::binary_manager::augment_path_env(&mut cmd, binaries_dir);
-    let output = cmd
-        .args(&args)
-        .arg("--dump-single-json")
-        .arg("--no-playlist")
-        .arg("--no-download")
-        .arg(url)
-        .output()
-        .map_err(|e| format!("Failed to probe video: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "Could not read video info: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
-        .map_err(|e| format!("Failed to parse video info: {e}"))
+fn dump_single_json<R: Runtime>(app: &AppHandle<R>, url: &str) -> Result<serde_json::Value, String> {
+    let args: Vec<String> = ["--dump-single-json", "--no-playlist", "--no-download", url]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    let stdout = crate::engine::capture(app, &args, false)
+        .map_err(|e| format!("Could not read video info: {e}"))?;
+    serde_json::from_str(&stdout).map_err(|e| format!("Failed to parse video info: {e}"))
 }
 
 /// The title/thumbnail pair the job queue needs to make a freshly queued job
@@ -467,12 +443,7 @@ pub async fn fetch_job_metadata<R: Runtime>(
     cache: &crate::metadata_cache::SharedMetadataCache,
     url: &str,
 ) -> Result<JobMetadata, String> {
-    let paths = crate::binary_manager::resolve_paths(app_handle)?;
-    crate::binary_manager::ensure_executable(&paths)?;
-
-    let yt_dlp = paths.yt_dlp.clone();
-    let js_runtime = crate::binary_manager::resolve_js_runtime(&paths);
-    let binaries_dir = paths.dir.clone();
+    let app = app_handle.clone();
     let url_for_task = url.to_string();
     // `METADATA_MAX_AGE`, not `PLAYBACK_MAX_AGE`: only `title` and `thumbnail`
     // are read below, and neither expires the way a format URL does. Enqueueing
@@ -482,11 +453,9 @@ pub async fn fetch_job_metadata<R: Runtime>(
         url,
         crate::metadata_cache::METADATA_MAX_AGE,
         move || async move {
-            tokio::task::spawn_blocking(move || {
-                dump_single_json(&yt_dlp, &binaries_dir, js_runtime.as_ref(), &url_for_task)
-            })
-            .await
-            .map_err(|e| format!("Metadata task failed: {e}"))?
+            tokio::task::spawn_blocking(move || dump_single_json(&app, &url_for_task))
+                .await
+                .map_err(|e| format!("Metadata task failed: {e}"))?
         },
     )
     .await?;
@@ -503,24 +472,10 @@ pub async fn resolve_preview<R: Runtime>(
     cache: State<'_, crate::metadata_cache::SharedMetadataCache>,
     url: String,
 ) -> Result<PreviewSource, String> {
-    let paths = crate::binary_manager::resolve_paths(&app_handle)?;
-    crate::binary_manager::ensure_executable(&paths)?;
-
     // Run on a blocking thread: yt-dlp's network fetch + extraction can take
     // several seconds, and this is an async fn — calling it inline would
-    // block whichever runtime thread services this future, stalling other
-    // concurrent Tauri commands (the job queue now runs downloads
-    // concurrently on that same runtime).
-    let yt_dlp = paths.yt_dlp.clone();
-    // yt-dlp deprecates runtime-less YouTube extraction and warns loudly about
-    // it, so a runtime is passed when one is available. It is not what makes
-    // previews work: measured on a real YouTube URL the muxed-format count is
-    // zero with a runtime and zero without — see `pick_video_only_format`, which
-    // is the reason this path now resolves at all. `None` here means the machine
-    // has no runtime; the invocation is then exactly what it was before.
-    let js_runtime = crate::binary_manager::resolve_js_runtime(&paths);
-    // The directory the bundled tools live in, for `augment_path_env` below.
-    let binaries_dir = paths.dir.clone();
+    // block whichever runtime thread services this future.
+    let app = app_handle.clone();
     let url_for_task = url.clone();
     // Through the shared cache, so that re-opening the trim panel on a URL just
     // probed — and the metadata fetch `enqueue_job` spawns for that same URL —
@@ -533,11 +488,9 @@ pub async fn resolve_preview<R: Runtime>(
         &url,
         crate::metadata_cache::PLAYBACK_MAX_AGE,
         move || async move {
-            tokio::task::spawn_blocking(move || {
-                dump_single_json(&yt_dlp, &binaries_dir, js_runtime.as_ref(), &url_for_task)
-            })
-            .await
-            .map_err(|e| format!("Probe task failed: {e}"))?
+            tokio::task::spawn_blocking(move || dump_single_json(&app, &url_for_task))
+                .await
+                .map_err(|e| format!("Probe task failed: {e}"))?
         },
     )
     .await?;
@@ -618,9 +571,6 @@ pub async fn fetch_preview_proxy<R: Runtime>(
     use std::hash::{Hash, Hasher};
     use tauri::Manager;
 
-    let paths = crate::binary_manager::resolve_paths(&app_handle)?;
-    crate::binary_manager::ensure_executable(&paths)?;
-
     let cache_dir = app_handle
         .path()
         .app_cache_dir()
@@ -648,48 +598,32 @@ pub async fn fetch_preview_proxy<R: Runtime>(
     // Command::output() inline on this async fn would stall the runtime
     // thread and, with it, other concurrent Tauri commands (the job queue
     // runs downloads concurrently on the same runtime).
-    let yt_dlp = paths.yt_dlp.clone();
-    let ffmpeg = paths.ffmpeg.clone();
-    // Same reason as in `resolve_preview`: with no runtime the format selector
-    // below matches nothing and this download fails outright.
-    let js_runtime = crate::binary_manager::resolve_js_runtime(&paths);
-    let binaries_dir = paths.dir.clone();
+    let app = app_handle.clone();
     let tmp_for_task = tmp.clone();
     let url_for_task = url.clone();
-    let output = tokio::task::spawn_blocking(move || {
-        let mut args: Vec<String> = Vec::new();
-        crate::binary_manager::push_js_runtime_args(&mut args, js_runtime.as_ref());
-        let mut cmd = Command::new(&yt_dlp);
-        // This one merges with ffmpeg (`--merge-output-format mp4`) and can
-        // have it fetch over HTTPS, so it needs the CA bundle in its
-        // environment just as much as the download runner does.
-        crate::binary_manager::augment_path_env(&mut cmd, &binaries_dir);
-        cmd.args(&args)
-            .arg("--no-playlist")
-            .arg("-f")
-            .arg(PROXY_FORMAT_SELECTOR)
-            .arg("--merge-output-format")
-            .arg("mp4")
-            .arg("--ffmpeg-location")
-            .arg(&ffmpeg)
-            .arg("-o")
-            .arg(&tmp_for_task)
-            .arg(&url_for_task);
-        cmd.output()
+    let result = tokio::task::spawn_blocking(move || {
+        let args: Vec<String> = vec![
+            "--no-playlist".into(),
+            "-f".into(),
+            PROXY_FORMAT_SELECTOR.into(),
+            "--merge-output-format".into(),
+            "mp4".into(),
+            "-o".into(),
+            tmp_for_task.to_string_lossy().into_owned(),
+            url_for_task,
+        ];
+        // Merges with ffmpeg, and can have it fetch over HTTPS.
+        crate::engine::capture(&app, &args, true)
     })
     .await
-    .map_err(|e| format!("Preview download task failed: {e}"))?
-    .map_err(|e| format!("Failed to fetch preview: {e}"))?;
+    .map_err(|e| format!("Preview download task failed: {e}"))?;
 
-    if !output.status.success() {
+    if let Err(e) = result {
         // Never leave a partial file behind for a later call to mistake for
         // a complete proxy — that is what turned a transient failure into a
         // permanently poisoned cache entry.
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!(
-            "Preview download failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        return Err(format!("Preview download failed: {e}"));
     }
 
     // Atomic within one directory on every platform this app targets: after

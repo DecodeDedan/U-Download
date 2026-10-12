@@ -495,7 +495,7 @@ export default function TrimWorkbench({ url, onChange, onClose }) {
       : 'Loading');
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div className="flex flex-1 flex-col md:min-h-0">
       <div className="flex items-center gap-3 px-5 pb-2">
         <span className="label-region shrink-0">Preview</span>
         <p className="min-w-0 flex-1 truncate text-meta text-fg-muted" title={source?.title || ''}>
@@ -511,7 +511,7 @@ export default function TrimWorkbench({ url, onChange, onClose }) {
       {/* The stage. Full-bleed between two hairlines rather than boxed in a
           card: the picture is the content, and a frame around it would only
           add a second edge next to the window's own. */}
-      <div className="on-stage relative flex min-h-[6rem] flex-1 items-center justify-center overflow-hidden border-y border-hair bg-stage">
+      <div className="on-stage relative flex aspect-video min-h-[6rem] flex-1 items-center justify-center overflow-hidden border-y border-hair bg-stage md:aspect-auto">
         {phase === 'error' ? (
           <div className="max-w-sm px-6 py-5 text-center">
             <p className="text-body text-danger">{error}</p>
@@ -809,7 +809,8 @@ export default function TrimWorkbench({ url, onChange, onClose }) {
         )}
 
         {playable && (
-          <p className="w-full text-meta text-fg-muted">
+          // Keyboard-only advice; hidden where there is no hover-capable pointer.
+          <p className="w-full text-meta text-fg-muted [@media(hover:none)]:hidden">
             Arrow keys nudge the playhead a second, Shift for a tenth.
           </p>
         )}

@@ -81,24 +81,70 @@ fn is_youtube(url: &str) -> bool {
 /// It is a parameter rather than a `DownloadSpec` field for the same reason
 /// `ffmpeg_path` is: both are properties of the installation the runner
 /// resolved, not of the job the user queued.
-pub fn build_download_args(
-    spec: &DownloadSpec,
-    ffmpeg_path: &str,
-    js_runtime: Option<&str>,
-) -> Vec<String> {
+/// How yt-dlp is run on this platform, which decides how ffmpeg, the JS
+/// runtime and aria2c are named to it.
+#[derive(Debug, Clone)]
+pub enum Toolchain {
+    /// Bundled binaries, spawned directly.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    Desktop {
+        ffmpeg: String,
+        /// `name:path` for `--js-runtimes`; `None` reproduces the
+        /// pre-runtime command line exactly.
+        js_runtime: Option<String>,
+    },
+    /// youtubedl-android, which passes its own `--ffmpeg-location` and QuickJS
+    /// runtime and ships aria2c as `libaria2c.so`.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    Android {
+        /// Android has no PEM trust store for aria2c to find on its own.
+        ca_bundle: String,
+        /// App-private scratch space. ffmpeg's trimmed-section writes fail on
+        /// shared storage, so every intermediate file lives here and yt-dlp
+        /// moves only the finished file to the download folder.
+        temp_dir: String,
+    },
+}
+
+impl Toolchain {
+    /// The toolchain for one job: on Android its scratch files go in a
+    /// directory of their own, so they can be deleted however the job ends.
+    pub fn for_job(&self, job_id: &str) -> Toolchain {
+        match self {
+            Toolchain::Desktop { .. } => self.clone(),
+            Toolchain::Android { ca_bundle, temp_dir } => Toolchain::Android {
+                ca_bundle: ca_bundle.clone(),
+                temp_dir: format!("{}/{job_id}", temp_dir.trim_end_matches('/')),
+            },
+        }
+    }
+
+    /// Where this job's intermediate files live, when they live apart from
+    /// the output folder.
+    pub fn job_temp_dir(&self) -> Option<&str> {
+        match self {
+            Toolchain::Desktop { .. } => None,
+            Toolchain::Android { temp_dir, .. } => Some(temp_dir),
+        }
+    }
+}
+
+pub fn build_download_args(spec: &DownloadSpec, toolchain: &Toolchain) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     let trimming = spec.trim.is_some();
 
-    if let Some(runtime) = js_runtime {
+    if let Toolchain::Desktop { js_runtime: Some(runtime), .. } = toolchain {
         args.push("--js-runtimes".into());
-        args.push(runtime.to_string());
+        args.push(runtime.clone());
     }
 
     args.push("--progress".into());
     args.push("--newline".into());
     args.push("--no-playlist".into());
-    args.push("--ffmpeg-location".into());
-    args.push(ffmpeg_path.into());
+    if let Toolchain::Desktop { ffmpeg, .. } = toolchain {
+        args.push("--ffmpeg-location".into());
+        args.push(ffmpeg.clone());
+    }
 
     // An external downloader cannot serve ranged section requests, so trimmed
     // jobs fall back to yt-dlp's native ranged fetch.
@@ -107,10 +153,32 @@ pub fn build_download_args(
         args.push(CONCURRENT_FRAGMENTS.into());
     }
     if !trimming && !is_youtube(&spec.url) {
-        args.push("--external-downloader".into());
-        args.push("aria2c".into());
-        args.push("--external-downloader-args".into());
-        args.push(ARIA2C_ARGS.into());
+        match toolchain {
+            Toolchain::Desktop { .. } => {
+                args.push("--external-downloader".into());
+                args.push("aria2c".into());
+                args.push("--external-downloader-args".into());
+                args.push(ARIA2C_ARGS.into());
+            }
+            // yt-dlp keeps only the last `aria2c:` value, and youtubedl-android
+            // sets one (summary interval + CA bundle) before ours, so ours
+            // must carry both or aria2c loses its readout and its trust store.
+            Toolchain::Android { ca_bundle, .. } => {
+                args.push("--downloader".into());
+                args.push("libaria2c.so".into());
+                args.push("--downloader-args".into());
+                args.push(format!(
+                    "aria2c:{ARIA2C_ARGS} --summary-interval=1 --ca-certificate={ca_bundle}"
+                ));
+            }
+        }
+    }
+
+    // AV1 video and Opus audio are YouTube's "best", and many Android players
+    // open them with no picture or no sound. Resolution still ranks first.
+    if matches!(toolchain, Toolchain::Android { .. }) {
+        args.push("-S".into());
+        args.push("res,vcodec:h264,acodec:m4a".into());
     }
 
     match &spec.format {
@@ -150,8 +218,25 @@ pub fn build_download_args(
         args.push("--force-keyframes-at-cuts".into());
     }
 
-    args.push("-o".into());
-    args.push(spec.output_template.clone());
+    match toolchain {
+        Toolchain::Desktop { .. } => {
+            args.push("-o".into());
+            args.push(spec.output_template.clone());
+        }
+        Toolchain::Android { temp_dir, .. } => {
+            // An absolute `-o` makes yt-dlp ignore `-P temp:`, so the folder
+            // goes in `home:` and the template is relative to it.
+            let template = std::path::Path::new(&spec.output_template);
+            let folder = template.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = template.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            args.push("-P".into());
+            args.push(format!("home:{folder}"));
+            args.push("-P".into());
+            args.push(format!("temp:{temp_dir}"));
+            args.push("-o".into());
+            args.push(name);
+        }
+    }
     args.push(spec.url.clone());
 
     args
@@ -508,17 +593,123 @@ mod tests {
         args.join(" ")
     }
 
+    fn desktop(js_runtime: Option<&str>) -> Toolchain {
+        Toolchain::Desktop {
+            ffmpeg: "/bin/ffmpeg".to_string(),
+            js_runtime: js_runtime.map(str::to_string),
+        }
+    }
+
+    fn android() -> Toolchain {
+        Toolchain::Android {
+            ca_bundle: "/data/engine/cert.pem".to_string(),
+            temp_dir: "/data/app/cache/downloads".to_string(),
+        }
+    }
+
+    fn spec_for_url(url: &str) -> DownloadSpec {
+        DownloadSpec { url: url.to_string(), ..spec_with_trim(None) }
+    }
+
+    // youtubedl-android adds its own --ffmpeg-location and QuickJS runtime;
+    // a second copy from us would override them with paths that do not exist.
+    #[test]
+    fn android_names_neither_ffmpeg_nor_a_js_runtime() {
+        for trim in [None, Some(TrimRange { start: 1.0, end: 2.0 })] {
+            let args = build_download_args(&spec_with_trim(trim), &android());
+            assert!(!args.iter().any(|a| a == "--ffmpeg-location" || a == "--js-runtimes"), "{args:?}");
+        }
+    }
+
+    // The library's own aria2c args carry the CA bundle; yt-dlp keeps only the
+    // last `aria2c:` value, so ours must repeat it alongside the 16-connection
+    // profile or every HTTPS download fails certificate verification.
+    #[test]
+    fn android_hands_other_sites_to_libaria2c_with_the_motrix_profile_and_ca_bundle() {
+        let args = build_download_args(&spec_for_url("https://vimeo.com/1"), &android());
+        let i = index_of(&args, "--downloader");
+        assert_eq!(args[i + 1], "libaria2c.so");
+        let j = index_of(&args, "--downloader-args");
+        let value = &args[j + 1];
+        assert!(value.starts_with("aria2c:--split=16 --max-connection-per-server=16"), "{value}");
+        assert!(value.contains("--ca-certificate=/data/engine/cert.pem"), "{value}");
+        assert!(value.contains("--summary-interval=1"), "{value}");
+    }
+
+    #[test]
+    fn android_keeps_youtube_on_ytdlps_own_parallel_downloader() {
+        let args = build_download_args(&spec_for_url("https://youtu.be/abc"), &android());
+        assert!(!args.iter().any(|a| a == "--downloader"), "{args:?}");
+        let i = index_of(&args, "--concurrent-fragments");
+        assert_eq!(args[i + 1], "16");
+    }
+
+    // ffmpeg's section writes fail on shared storage; work happens in the
+    // app's private cache and only the finished file is moved to Download/.
+    // `-P home:` instead of an absolute `-o`, which would make yt-dlp ignore
+    // the temp path entirely.
+    #[test]
+    fn android_stages_work_in_the_private_temp_dir_and_saves_to_the_folder() {
+        let args = build_download_args(&spec_with_trim(None), &android());
+        let joined = joined(&args);
+        assert!(joined.contains("-P home:/out"), "{joined}");
+        assert!(joined.contains("-P temp:/data/app/cache/downloads"), "{joined}");
+        let o = index_of(&args, "-o");
+        assert_eq!(args[o + 1], "%(title)s.%(ext)s");
+    }
+
+    // A cancelled job leaves a .part behind; a directory per job is what lets
+    // it be deleted without touching another job's work in progress.
+    #[test]
+    fn each_android_job_gets_its_own_temp_dir() {
+        let toolchain = android().for_job("job-1");
+        assert_eq!(toolchain.job_temp_dir(), Some("/data/app/cache/downloads/job-1"));
+        let args = build_download_args(&spec_with_trim(None), &toolchain);
+        assert!(joined(&args).contains("-P temp:/data/app/cache/downloads/job-1"));
+    }
+
+    #[test]
+    fn desktop_jobs_have_no_temp_dir() {
+        assert_eq!(desktop(None).for_job("job-1").job_temp_dir(), None);
+    }
+
+    // "Best" on YouTube is AV1 + Opus, which many Android players open with
+    // no picture or no sound. Same resolution, but the codecs every phone
+    // decodes in hardware win the tie.
+    #[test]
+    fn android_prefers_h264_and_aac_without_lowering_resolution() {
+        let args = build_download_args(&spec_with_trim(None), &android());
+        let i = index_of(&args, "-S");
+        assert_eq!(args[i + 1], "res,vcodec:h264,acodec:m4a");
+    }
+
+    #[test]
+    fn desktop_keeps_ytdlps_default_format_order() {
+        let args = build_download_args(&spec_with_trim(None), &desktop(None));
+        assert!(!args.iter().any(|a| a == "-S"), "{args:?}");
+    }
+
+    #[test]
+    fn android_trimmed_jobs_skip_aria2c() {
+        let spec = DownloadSpec {
+            trim: Some(TrimRange { start: 1.0, end: 2.0 }),
+            ..spec_for_url("https://vimeo.com/1")
+        };
+        let args = build_download_args(&spec, &android());
+        assert!(!args.iter().any(|a| a == "--downloader"), "{args:?}");
+    }
+
     #[test]
     fn trimmed_job_requests_only_the_selected_section() {
         let spec = spec_with_trim(Some(TrimRange { start: 10.0, end: 20.0 }));
-        let args = build_download_args(&spec, "/bin/ffmpeg", None);
+        let args = build_download_args(&spec, &desktop(None));
         assert!(joined(&args).contains("--download-sections *00:00:10.000-00:00:20.000"));
     }
 
     #[test]
     fn trimmed_job_forces_keyframes_at_cuts() {
         let spec = spec_with_trim(Some(TrimRange { start: 10.0, end: 20.0 }));
-        let args = build_download_args(&spec, "/bin/ffmpeg", None);
+        let args = build_download_args(&spec, &desktop(None));
         assert!(args.contains(&"--force-keyframes-at-cuts".to_string()));
     }
 
@@ -528,7 +719,7 @@ mod tests {
     fn no_trim_path_ever_uses_stream_copy() {
         for trim in [None, Some(TrimRange { start: 1.0, end: 2.0 })] {
             let spec = spec_with_trim(trim);
-            let args = build_download_args(&spec, "/bin/ffmpeg", None);
+            let args = build_download_args(&spec, &desktop(None));
             let text = joined(&args);
             assert!(!text.contains("-c copy"), "stream copy must never appear: {}", text);
             assert!(
@@ -542,7 +733,7 @@ mod tests {
     #[test]
     fn trimmed_job_omits_aria2c() {
         let spec = spec_with_trim(Some(TrimRange { start: 10.0, end: 20.0 }));
-        let args = build_download_args(&spec, "/bin/ffmpeg", None);
+        let args = build_download_args(&spec, &desktop(None));
         assert!(!args.contains(&"--external-downloader".to_string()));
         assert!(!joined(&args).contains("aria2c"));
     }
@@ -550,7 +741,7 @@ mod tests {
     #[test]
     fn untrimmed_job_keeps_aria2c_acceleration() {
         let spec = spec_with_trim(None);
-        let args = build_download_args(&spec, "/bin/ffmpeg", None);
+        let args = build_download_args(&spec, &desktop(None));
         assert!(args.contains(&"--external-downloader".to_string()));
         assert!(args.contains(&"aria2c".to_string()));
         assert!(!args.contains(&"--download-sections".to_string()));
@@ -562,7 +753,7 @@ mod tests {
             format: FormatChoice::Quick { kind: MediaKind::Mp3, height: None },
             ..spec_with_trim(Some(TrimRange { start: 3.0, end: 9.0 }))
         };
-        let args = build_download_args(&spec, "/bin/ffmpeg", None);
+        let args = build_download_args(&spec, &desktop(None));
         assert!(args.contains(&"-x".to_string()));
         assert!(joined(&args).contains("--audio-format mp3"));
         assert!(joined(&args).contains("--download-sections *00:00:03.000-00:00:09.000"));
@@ -574,14 +765,14 @@ mod tests {
             format: FormatChoice::Exact { format_id: "137".to_string() },
             ..spec_with_trim(None)
         };
-        let args = build_download_args(&spec, "/bin/ffmpeg", None);
+        let args = build_download_args(&spec, &desktop(None));
         assert!(joined(&args).contains("-f 137+bestaudio/137"));
     }
 
     #[test]
     fn quick_height_maps_to_capped_format_selector() {
         let spec = spec_with_trim(None);
-        let args = build_download_args(&spec, "/bin/ffmpeg", None);
+        let args = build_download_args(&spec, &desktop(None));
         assert!(joined(&args).contains("bestvideo[height<=720]+bestaudio/best[height<=720]"));
     }
 
@@ -592,7 +783,7 @@ mod tests {
 
     #[test]
     fn untrimmed_job_opens_sixteen_connections() {
-        let args = build_download_args(&spec_with_trim(None), "/bin/ffmpeg", None);
+        let args = build_download_args(&spec_with_trim(None), &desktop(None));
         let aria2 = aria2c_args(&args);
         assert!(aria2.contains("--split=16"), "{aria2}");
         assert!(aria2.contains("--max-connection-per-server=16"), "{aria2}");
@@ -603,7 +794,7 @@ mod tests {
     // occurrence of a flag: anything below 16 here slows every download.
     #[test]
     fn aria2c_arguments_never_drop_below_ytdlp_defaults() {
-        let args = build_download_args(&spec_with_trim(None), "/bin/ffmpeg", None);
+        let args = build_download_args(&spec_with_trim(None), &desktop(None));
         let aria2 = aria2c_args(&args);
         for token in aria2.split_whitespace() {
             for flag in ["--split=", "--max-connection-per-server="] {
@@ -631,7 +822,7 @@ mod tests {
             "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ",
             "https://YOUTUBE.com/shorts/abc",
         ] {
-            let args = build_download_args(&spec_for(url), "/bin/ffmpeg", None);
+            let args = build_download_args(&spec_for(url), &desktop(None));
             assert!(!args.contains(&"--external-downloader".to_string()), "{url}");
         }
     }
@@ -644,7 +835,7 @@ mod tests {
             "https://vimeo.com/76979871",
             "not a url",
         ] {
-            let args = build_download_args(&spec_for(url), "/bin/ffmpeg", None);
+            let args = build_download_args(&spec_for(url), &desktop(None));
             assert!(args.contains(&"--external-downloader".to_string()), "{url}");
         }
     }
@@ -654,14 +845,14 @@ mod tests {
     #[test]
     fn untrimmed_jobs_fetch_sixteen_fragments_at_once() {
         for url in ["https://www.youtube.com/watch?v=x", "https://vimeo.com/76979871"] {
-            let args = build_download_args(&spec_for(url), "/bin/ffmpeg", None);
+            let args = build_download_args(&spec_for(url), &desktop(None));
             assert_eq!(args[index_of(&args, "--concurrent-fragments") + 1], "16", "{url}");
         }
     }
 
     #[test]
     fn aria2c_gets_motrix_io_and_recovery_tuning() {
-        let args = build_download_args(&spec_with_trim(None), "/bin/ffmpeg", None);
+        let args = build_download_args(&spec_with_trim(None), &desktop(None));
         let aria2 = aria2c_args(&args);
         for flag in [
             "--disk-cache=32M",
@@ -889,7 +1080,7 @@ mod tests {
     #[test]
     fn js_runtime_is_passed_through_with_its_name_and_path() {
         let spec = spec_with_trim(None);
-        let args = build_download_args(&spec, "/bin/ffmpeg", Some("node:/usr/local/bin/node"));
+        let args = build_download_args(&spec, &desktop(Some("node:/usr/local/bin/node")));
         let i = index_of(&args, "--js-runtimes");
         assert_eq!(args[i + 1], "node:/usr/local/bin/node");
     }
@@ -897,7 +1088,7 @@ mod tests {
     #[test]
     fn bundled_deno_runtime_keeps_its_own_name() {
         let spec = spec_with_trim(Some(TrimRange { start: 1.0, end: 2.0 }));
-        let args = build_download_args(&spec, "/bin/ffmpeg", Some("deno:/app/binaries/deno"));
+        let args = build_download_args(&spec, &desktop(Some("deno:/app/binaries/deno")));
         let i = index_of(&args, "--js-runtimes");
         assert_eq!(args[i + 1], "deno:/app/binaries/deno");
     }
@@ -908,7 +1099,7 @@ mod tests {
     fn absent_js_runtime_adds_no_argument() {
         for trim in [None, Some(TrimRange { start: 1.0, end: 2.0 })] {
             let spec = spec_with_trim(trim);
-            let args = build_download_args(&spec, "/bin/ffmpeg", None);
+            let args = build_download_args(&spec, &desktop(None));
             assert!(
                 !args.iter().any(|a| a == "--js-runtimes"),
                 "no runtime must mean no flag: {:?}", args

@@ -10,15 +10,17 @@
 //!    comment on it says what it covers.
 //! 2. **A job is claimed before its thread starts.** See `pump`.
 
-use crate::binary_manager;
 use crate::jobs::{JobId, JobProgress, JobStatus, SharedJobs};
-use crate::proc;
 use crate::queue;
-use crate::ytdlp::{build_download_args, parse_progress_line, DownloadSpec};
-use std::io::Read;
+use crate::ytdlp::{build_download_args, parse_progress_line, DownloadSpec, Toolchain};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use tauri::{Emitter, Runtime, Window};
+#[cfg(not(target_os = "android"))]
+use {
+    crate::{binary_manager, proc},
+    std::io::Read,
+    std::process::{Command, Stdio},
+};
 
 /// Emits at most one progress event per job per interval, so several concurrent
 /// downloads cannot flood the webview bridge.
@@ -30,15 +32,20 @@ const PROGRESS_EMIT_INTERVAL_MS: u128 = 500;
 /// recursively; five loose `PathBuf`/`u32` arguments were easy to transpose.
 #[derive(Debug, Clone)]
 pub struct RunnerContext {
+    #[cfg(not(target_os = "android"))]
     pub yt_dlp: PathBuf,
-    pub ffmpeg: PathBuf,
+    #[cfg(not(target_os = "android"))]
     pub binaries_dir: PathBuf,
+    /// How ffmpeg, the JS runtime and aria2c are named to yt-dlp here.
+    pub toolchain: Toolchain,
     pub concurrency: u32,
-    /// The JavaScript runtime yt-dlp should be told about, if this machine has
-    /// one. `None` is a supported state: the download then runs with exactly
-    /// the arguments it used before runtimes were wired in.
-    pub js_runtime: Option<binary_manager::JsRuntime>,
 }
+
+/// How one download ended, from the runner's point of view.
+///
+/// `None` from an executor means a cancel or pause took the job over and has
+/// already published its own state, so the runner must report nothing.
+type Finished = Option<Result<Option<String>, String>>;
 
 /// Sends the current state of one job to the frontend.
 ///
@@ -73,6 +80,12 @@ fn fail<R: Runtime>(window: &Window<R>, jobs: &SharedJobs, id: &JobId, message: 
 /// result, and for audio extraction `[ExtractAudio]` follows the container
 /// download the same way.
 fn destination_from_line(line: &str) -> Option<String> {
+    // `[MoveFiles] Moving file "<temp>" to "<final>"`: the last word on where
+    // the file lives when yt-dlp stages work in a temp dir (Android).
+    if let Some(rest) = line.strip_prefix("[MoveFiles] Moving file ") {
+        let target = rest.rsplit_once("\" to \"")?.1.trim_end().trim_end_matches('"');
+        return (!target.is_empty()).then(|| target.to_string());
+    }
     for prefix in [
         "[download] Destination: ",
         "[ExtractAudio] Destination: ",
@@ -102,11 +115,13 @@ fn destination_from_line(line: &str) -> Option<String> {
 /// Empty records are dropped. That is also what stops a `\r\n` pair from
 /// producing a spurious blank record between its two bytes — and a blank
 /// record is not something either parser could use anyway.
+#[cfg(not(target_os = "android"))]
 #[derive(Default)]
 struct RecordSplitter {
     pending: Vec<u8>,
 }
 
+#[cfg(not(target_os = "android"))]
 impl RecordSplitter {
     /// Feeds one chunk of bytes and returns every record it completed.
     ///
@@ -235,15 +250,8 @@ pub fn run_job<R: Runtime>(window: Window<R>, jobs: SharedJobs, id: JobId, ctx: 
     // Trimming lives entirely in these arguments (`--download-sections` plus
     // `--force-keyframes-at-cuts`). There is deliberately no FFmpeg post-pass:
     // the `-c copy` cut it used to perform could only land on a keyframe.
-    // Recent yt-dlp cannot resolve a YouTube format without a JS runtime, so
-    // without this the selectors above fail as "Requested format is not
-    // available"; `None` reproduces the pre-runtime command line exactly.
-    let js_runtime = ctx.js_runtime.as_ref().map(|rt| rt.flag_value());
-    let args = build_download_args(
-        &spec,
-        &ctx.ffmpeg.to_string_lossy(),
-        js_runtime.as_deref(),
-    );
+    let toolchain = ctx.toolchain.for_job(&id);
+    let args = build_download_args(&spec, &toolchain);
 
     // The span of the requested section, which is what ffmpeg's timeline
     // progress has to be measured against on a trimmed job. `None` for an
@@ -253,9 +261,68 @@ pub fn run_job<R: Runtime>(window: Window<R>, jobs: SharedJobs, id: JobId, ctx: 
         .map(|range| range.end - range.start)
         .filter(|span| *span > 0.0);
 
+    let finished = execute(&window, &jobs, &id, &ctx, &args, section_seconds);
+    // Whatever happened, nothing in the job's scratch directory is still
+    // needed: the finished file has already been moved out of it.
+    if let Some(dir) = toolchain.job_temp_dir() {
+        if let Err(e) = std::fs::remove_dir_all(dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("Could not clear temp files for job {id}: {e}");
+            }
+        }
+    }
+    let Some(result) = finished else {
+        return;
+    };
+
+    match result {
+        Ok(output_path) => {
+            let finished = {
+                // Lock scope: the completion writes, then one read to build
+                // the event payload.
+                let mut reg = jobs.lock().unwrap();
+                if let Some(path) = output_path {
+                    reg.set_output_path(&id, PathBuf::from(path));
+                }
+                let mut progress = reg.get(&id).map(|job| job.progress).unwrap_or_default();
+                progress.percentage = 100.0;
+                progress.speed_bytes_per_sec = 0;
+                progress.eta_seconds = Some(0);
+                progress.bytes_downloaded = progress.total_bytes;
+                reg.update_progress(&id, progress);
+                reg.set_status(&id, JobStatus::Done);
+                reg.get(&id)
+            };
+
+            if let Some(job) = finished {
+                let _ = window.emit("job-updated", &job);
+                let _ = window.emit(
+                    "job-done",
+                    serde_json::json!({
+                        "job_id": id,
+                        "output_path": job.output_path,
+                        "title": job.title,
+                    }),
+                );
+            }
+        }
+        Err(message) => fail(&window, &jobs, &id, message),
+    }
+}
+
+/// Runs yt-dlp as a child process group and reads its progress.
+#[cfg(not(target_os = "android"))]
+fn execute<R: Runtime>(
+    window: &Window<R>,
+    jobs: &SharedJobs,
+    id: &JobId,
+    ctx: &RunnerContext,
+    args: &[String],
+    section_seconds: Option<f64>,
+) -> Finished {
     let mut cmd = Command::new(&ctx.yt_dlp);
     binary_manager::augment_path_env(&mut cmd, &ctx.binaries_dir);
-    cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     // So that cancelling reaches the process actually doing the download —
     // ffmpeg on a trimmed job, aria2c otherwise — and not just yt-dlp.
     proc::spawn_in_own_process_group(&mut cmd);
@@ -264,8 +331,7 @@ pub fn run_job<R: Runtime>(window: Window<R>, jobs: SharedJobs, id: JobId, ctx: 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            fail(&window, &jobs, &id, format!("Failed to start yt-dlp: {e}"));
-            return;
+            return Some(Err(format!("Failed to start yt-dlp: {e}")));
         }
     };
 
@@ -342,10 +408,10 @@ pub fn run_job<R: Runtime>(window: Window<R>, jobs: SharedJobs, id: JobId, ctx: 
     // user's cancel silently discarded.
     let orphan = {
         let mut reg = jobs.lock().unwrap();
-        if queue::promote_to_downloading(&mut reg, &id) {
+        if queue::promote_to_downloading(&mut reg, id) {
             // Attached in the same scope as the promotion, so no other caller
             // can observe a Downloading job with no cancellable process.
-            reg.attach_child(&id, child);
+            reg.attach_child(id, child);
             None
         } else {
             Some(child)
@@ -359,10 +425,10 @@ pub fn run_job<R: Runtime>(window: Window<R>, jobs: SharedJobs, id: JobId, ctx: 
         // emitted for it, so this thread reports nothing.
         proc::kill_tree(&mut child);
         let _ = child.wait();
-        return;
+        return None;
     }
 
-    emit_job(&window, &jobs, &id);
+    emit_job(window, jobs, id);
 
     let mut output_path: Option<String> = None;
 
@@ -384,9 +450,9 @@ pub fn run_job<R: Runtime>(window: Window<R>, jobs: SharedJobs, id: JobId, ctx: 
             };
             for record in splitter.push(&chunk[..read]) {
                 consume_record(
-                    &window,
-                    &jobs,
-                    &id,
+                    window,
+                    jobs,
+                    id,
                     &record,
                     &mut output_path,
                     &mut last_emit,
@@ -399,9 +465,9 @@ pub fn run_job<R: Runtime>(window: Window<R>, jobs: SharedJobs, id: JobId, ctx: 
         // progress update only exists as this fragment.
         if let Some(record) = splitter.take_pending() {
             consume_record(
-                &window,
-                &jobs,
-                &id,
+                window,
+                jobs,
+                id,
                 &record,
                 &mut output_path,
                 &mut last_emit,
@@ -417,69 +483,84 @@ pub fn run_job<R: Runtime>(window: Window<R>, jobs: SharedJobs, id: JobId, ctx: 
     // Lock scope: one map write. Taking the child back out is what lets the
     // wait below happen with the mutex released. `None` means `cancel` got
     // there first and has already killed and reaped the process.
-    let child = { jobs.lock().unwrap().take_child(&id) };
+    let child = { jobs.lock().unwrap().take_child(id) };
     let status = child.map(|mut child| child.wait());
 
     // Lock scope: one read. `queue::still_running` is false once a cancel or
     // pause has taken the job over and published its own terminal state; see
     // its doc comment for why this thread must then report nothing.
-    let still_ours = { queue::still_running(&jobs.lock().unwrap(), &id) };
+    let still_ours = { queue::still_running(&jobs.lock().unwrap(), id) };
     if !still_ours {
-        return;
+        return None;
     }
 
-    match status {
-        Some(Ok(exit)) if exit.success() => {
-            let finished = {
-                // Lock scope: the completion writes, then one read to build
-                // the event payload.
-                let mut reg = jobs.lock().unwrap();
-                if let Some(path) = output_path {
-                    reg.set_output_path(&id, PathBuf::from(path));
-                }
-                let mut progress = reg.get(&id).map(|job| job.progress).unwrap_or_default();
-                progress.percentage = 100.0;
-                progress.speed_bytes_per_sec = 0;
-                progress.eta_seconds = Some(0);
-                progress.bytes_downloaded = progress.total_bytes;
-                reg.update_progress(&id, progress);
-                reg.set_status(&id, JobStatus::Done);
-                reg.get(&id)
-            };
-
-            if let Some(job) = finished {
-                let _ = window.emit("job-updated", &job);
-                let _ = window.emit(
-                    "job-done",
-                    serde_json::json!({
-                        "job_id": id,
-                        "output_path": job.output_path,
-                        "title": job.title,
-                    }),
-                );
-            }
-        }
+    Some(match status {
+        Some(Ok(exit)) if exit.success() => Ok(output_path),
         Some(Ok(exit)) => {
             let code = exit.code().unwrap_or(-1);
             let detail = stderr_text.trim();
-            let message = if detail.is_empty() {
+            Err(if detail.is_empty() {
                 format!("yt-dlp exited with {code}")
             } else {
                 format!("yt-dlp exited with {code}: {detail}")
-            };
-            fail(&window, &jobs, &id, message);
+            })
         }
-        Some(Err(e)) => fail(&window, &jobs, &id, format!("Process error: {e}")),
+        Some(Err(e)) => Err(format!("Process error: {e}")),
         // The registry no longer held the child and the job is not cancelled:
         // the process was reaped by something else, so there is no status to
         // report. Treat it as a failure rather than silently claiming success.
-        None => fail(
-            &window,
-            &jobs,
-            &id,
-            "yt-dlp process handle was lost before it could be waited on".to_string(),
-        ),
+        None => Err("yt-dlp process handle was lost before it could be waited on".to_string()),
+    })
+}
+
+/// Runs yt-dlp through the youtubedl-android engine and reads its progress.
+///
+/// The engine streams the same output records a desktop child writes, so they
+/// go through the same `consume_record`. There is no child to attach: a cancel
+/// reaches the engine through `cancel_job`/`pause_job` instead.
+#[cfg(target_os = "android")]
+fn execute<R: Runtime>(
+    window: &Window<R>,
+    jobs: &SharedJobs,
+    id: &JobId,
+    _ctx: &RunnerContext,
+    args: &[String],
+    section_seconds: Option<f64>,
+) -> Finished {
+    use tauri::Manager;
+    use tauri_plugin_udl_engine::{Engine, Outcome};
+
+    // Lock scope: one conditional status write. Refused when a cancel or
+    // pause landed between the claim and here; that caller has reported.
+    let promoted = { queue::promote_to_downloading(&mut jobs.lock().unwrap(), id) };
+    if !promoted {
+        return None;
     }
+    emit_job(window, jobs, id);
+
+    let engine = window.state::<Engine<R>>();
+    let mut output_path: Option<String> = None;
+    let mut last_emit = std::time::Instant::now();
+    let outcome = engine.execute(id, args, true, |record| {
+        consume_record(window, jobs, id, record, &mut output_path, &mut last_emit, section_seconds)
+    });
+
+    // Lock scope: one read. See `queue::still_running`.
+    if !{ queue::still_running(&jobs.lock().unwrap(), id) } {
+        return None;
+    }
+
+    Some(match outcome {
+        Outcome::Completed { .. } => {
+            if let Some(path) = &output_path {
+                engine.scan_media(path);
+            }
+            Ok(output_path)
+        }
+        Outcome::Failed { message } => Err(message),
+        // Stopped without the registry knowing, e.g. the OS killed the engine.
+        Outcome::Cancelled => Err("The download was stopped before it finished".to_string()),
+    })
 }
 
 /// Starts every job the scheduler currently permits.
@@ -619,9 +700,23 @@ mod tests {
         );
     }
 
+    // Android stages work in a private temp dir; the file the user gets is
+    // the one yt-dlp moves out of it, named only on this line.
+    #[test]
+    fn the_final_move_out_of_the_temp_dir_names_the_output() {
+        assert_eq!(
+            destination_from_line(
+                "[MoveFiles] Moving file \"/cache/tmp/Me at the zoo.mp4\" to \"/sdcard/Download/U-Download/Me at the zoo.mp4\""
+            )
+            .as_deref(),
+            Some("/sdcard/Download/U-Download/Me at the zoo.mp4")
+        );
+    }
+
     #[test]
     fn ignores_progress_and_other_chatter() {
         assert!(destination_from_line("[download]  42.0% of 10.00MiB at 1.00MiB/s").is_none());
+        assert!(destination_from_line("[MoveFiles] Moving file \"/tmp/a.mp4\"").is_none());
         assert!(destination_from_line("[youtube] Extracting URL: https://e/v").is_none());
     }
 

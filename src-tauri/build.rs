@@ -18,6 +18,13 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS not set");
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH not set");
 
+    // Android's yt-dlp, ffmpeg and aria2c ship inside the youtubedl-android
+    // engine (crates/tauri-plugin-udl-engine); there is nothing to bundle.
+    if target_os == "android" {
+        tauri_build::build();
+        return;
+    }
+
     // Determine the platform-specific binary directory
     let platform = get_platform_dir(&target_os, &target_arch);
     let binaries_src = PathBuf::from("binaries").join(platform);

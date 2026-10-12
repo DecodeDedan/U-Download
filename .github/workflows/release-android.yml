@@ -1,0 +1,148 @@
+name: release-android
+
+# The Android app ships on its own version line (1.x, set in
+# src-tauri/tauri.android.conf.json) and its own tags, `android-vX.Y.Z`,
+# independent of desktop releases (`vX.Y.Z`, release.yml).
+#
+# Two GitHub releases are written:
+#   android-vX.Y.Z   the versioned release, with every APK and checksums
+#   android-latest   a fixed tag whose U-Download-Android.apk is always the
+#                    newest build, so the download link never changes:
+#                    https://github.com/<repo>/releases/download/android-latest/U-Download-Android.apk
+#
+# Neither may ever be GitHub's "latest" release: desktop auto-update and the
+# macOS installer read releases/latest, and an APK release there breaks both.
+
+on:
+  push:
+    tags:
+      - 'android-v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-android
+  cancel-in-progress: false
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+      NDK_VERSION: 28.2.13676358
+      STABLE_TAG: android-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the tag matches the app version
+        run: |
+          VERSION=$(node -p "require('./src-tauri/tauri.android.conf.json').version")
+          if [ "android-v$VERSION" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match tauri.android.conf.json version $VERSION"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install the NDK
+        run: |
+          sdkmanager --install "ndk;${NDK_VERSION}"
+          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # Fails the job rather than publishing an APK no phone will install.
+      - name: Restore the release keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 is not set; cannot sign the APK"
+            exit 1
+          fi
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/udownload.keystore"
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/udownload.keystore" >> "$GITHUB_ENV"
+
+      # One APK per CPU family for people who want the smaller download, and
+      # one that runs on any phone (64- and 32-bit ARM) for everyone else.
+      - name: Build signed APKs
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          npm run tauri -- android build --apk --split-per-abi --target aarch64 --target armv7 --target x86_64
+          npm run tauri -- android build --apk --target aarch64 --target armv7
+
+      - name: Collect APKs and checksums
+        run: |
+          OUT=src-tauri/gen/android/app/build/outputs/apk
+          mkdir -p dist-android
+          cp "$OUT/universal/release/app-universal-release.apk" "dist-android/U-Download-Android-$VERSION.apk"
+          for pair in arm64:arm64-v8a arm:armeabi-v7a x86_64:x86_64; do
+            dir=${pair%%:*}; abi=${pair##*:}
+            cp "$OUT/$dir/release/app-$dir-release.apk" "dist-android/U-Download-Android-$VERSION-$abi.apk"
+          done
+          (cd dist-android && sha256sum *.apk > SHA256SUMS.txt)
+          ls -la dist-android
+
+      - name: Write release notes
+        run: |
+          PREV=$(git tag --list 'android-v*' --sort=-v:refname | grep -vx "$TAG" | head -1 || true)
+          RANGE=${PREV:+$PREV..}$TAG
+          {
+            echo "## U-Download for Android $VERSION"
+            echo
+            echo "**Download:** \`U-Download-Android-$VERSION.apk\` works on every Android 7.0+ phone."
+            echo "The \`-arm64-v8a\` / \`-armeabi-v7a\` files are smaller builds for one CPU type."
+            echo
+            echo "Install: open the APK on your phone and allow installs from this source when asked."
+            echo
+            echo "### Changes"
+            git log --pretty='- %s' "$RANGE" -- src src-tauri | head -60
+          } > NOTES.md
+          cat NOTES.md
+
+      - name: Publish the versioned release
+        run: |
+          gh release create "$TAG" dist-android/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "U-Download for Android $VERSION" \
+            --notes-file NOTES.md \
+            --latest=false
+
+      - name: Point the permanent download link at this build
+        run: |
+          cp "dist-android/U-Download-Android-$VERSION.apk" U-Download-Android.apk
+          if gh release view "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$STABLE_TAG" U-Download-Android.apk --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "U-Download for Android (latest: $VERSION)" --notes-file NOTES.md --latest=false
+          else
+            gh release create "$STABLE_TAG" U-Download-Android.apk --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "U-Download for Android (latest: $VERSION)" \
+              --notes-file NOTES.md --latest=false
+          fi

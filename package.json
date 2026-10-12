@@ -37,6 +37,7 @@
     "version:major": "./scripts/version-sync.sh $(node -e \"let v=require('./package.json').version.split('-')[0].split('.'); v[0]=(+(v[0]||0))+1; v[1]=0; v[2]=0; console.log([v[0],v[1],v[2]].join('.'))\")",
     "release:patch": "npm run version:patch && V=$(node -p \"require('./package.json').version\") && git add . && git commit -m \"chore: release v$V\" && git tag -fa latest -m latest && git tag -a v$V -m \"Release v$V\" && git push origin HEAD && git push -f origin latest && git push origin v$V",
     "release:minor": "npm run version:minor && V=$(node -p \"require('./package.json').version\") && git add . && git commit -m \"chore: release v$V\" && git tag -fa latest -m latest && git tag -a v$V -m \"Release v$V\" && git push origin HEAD && git push -f origin latest && git push origin v$V",
+    "release:android": "V=$(node -p \"require('./src-tauri/tauri.android.conf.json').version\") && git tag -a android-v$V -m \"U-Download for Android v$V\" && git push origin android-v$V",
     "release:major": "npm run version:major && V=$(node -p \"require('./package.json').version\") && git add . && git commit -m \"chore: release v$V\" && git tag -fa latest -m latest && git tag -a v$V -m \"Release v$V\" && git push origin HEAD && git push -f origin latest && git push origin v$V"
   },
   "dependencies": {
@@ -47,6 +48,7 @@
     "@tauri-apps/plugin-process": "^2.4.0",
     "@tauri-apps/plugin-store": "^2",
     "@tauri-apps/plugin-updater": "^2.13.0",
+    "gsap": "3.12.5",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

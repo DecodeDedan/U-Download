@@ -1,0 +1,8 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Theme.u_download" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <!-- The app opens in its light theme, so the frame shown before the
+             webview paints is the same canvas colour, never a white flash. -->
+        <item name="android:windowBackground">@color/udl_canvas</item>
+    </style>
+</resources>

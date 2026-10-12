@@ -134,6 +134,7 @@ impl JobRegistry {
         }
     }
 
+    #[cfg_attr(target_os = "android", allow(dead_code))] // Desktop child processes only.
     pub fn attach_child(&mut self, id: &JobId, child: std::process::Child) {
         if let Some(h) = self.handles.get_mut(id) {
             h.child = Some(child);
@@ -211,7 +212,9 @@ impl JobRegistry {
     pub fn cancel(&mut self, id: &JobId) {
         let child = self.take_child(id);
         if let Some(h) = self.handles.get_mut(id) {
-            h.job.status = JobStatus::Cancelled;
+            if !h.job.status.is_terminal() {
+                h.job.status = JobStatus::Cancelled;
+            }
         }
         if let Some(mut child) = child {
             std::thread::spawn(move || {
@@ -329,6 +332,17 @@ mod tests {
         let stored = reg.get(&id).unwrap().trim.unwrap();
         assert_eq!(stored.start, 5.0);
         assert_eq!(stored.end, 12.0);
+    }
+
+    // A late cancel (a double tap, or one racing completion) must not turn a
+    // finished download into a "cancelled" one whose file is on disk.
+    #[test]
+    fn cancelling_a_finished_job_leaves_it_finished() {
+        let mut reg = JobRegistry::new();
+        let id = reg.insert(sample_job());
+        reg.set_status(&id, JobStatus::Done);
+        reg.cancel(&id);
+        assert_eq!(reg.get(&id).unwrap().status, JobStatus::Done);
     }
 
     #[test]

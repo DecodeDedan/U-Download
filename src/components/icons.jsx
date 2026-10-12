@@ -115,3 +115,26 @@ export const IconQueue = (props) => (
     <path d="M4 17h7" />
   </Glyph>
 );
+
+export const IconMenu = (props) => (
+  <Glyph {...props}>
+    <path d="M4 7h16" />
+    <path d="M4 12h16" />
+    <path d="M4 17h16" />
+  </Glyph>
+);
+
+export const IconClose = (props) => (
+  <Glyph {...props}>
+    <path d="M6 6l12 12" />
+    <path d="M18 6 6 18" />
+  </Glyph>
+);
+
+export const IconExternal = (props) => (
+  <Glyph {...props}>
+    <path d="M13.5 4.5h6v6" />
+    <path d="M19.5 4.5 11 13" />
+    <path d="M17.5 13.5v5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-11a1 1 0 0 1 1-1h5" />
+  </Glyph>
+);

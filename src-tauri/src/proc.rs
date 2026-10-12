@@ -30,6 +30,7 @@ use std::process::Command;
 /// terminal group, which is a second benefit: a Ctrl-C in a terminal-launched
 /// dev build no longer reaches the downloader behind the app's back.
 #[cfg(unix)]
+#[cfg_attr(target_os = "android", allow(dead_code))] // Desktop child processes only.
 pub fn spawn_in_own_process_group(cmd: &mut Command) {
     // `process_group(0)` asks for a new group whose id is the child's own pid.
     // It is applied between fork and exec, so there is no window in which the

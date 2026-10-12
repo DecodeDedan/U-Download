@@ -59,6 +59,23 @@ that the app updates itself.
 > downloaded the DMG in a browser, drag it to Applications, try to open it once,
 > then go to System Settings → Privacy & Security and click **Open Anyway**.
 
+#### Android (7.0 and newer)
+The Android app has its own version line (1.x) and releases
+([`android-v*`](https://github.com/DecodeDedan/U-Download/releases?q=android-v&expanded=true)).
+
+**Download:** https://github.com/DecodeDedan/U-Download/releases/download/android-latest/U-Download-Android.apk
+
+This link always serves the newest version and runs on any Android phone.
+Smaller builds for a single CPU type (`arm64-v8a`, `armeabi-v7a`) are attached to
+each versioned release.
+
+1. Open the link on your phone and download the APK.
+2. Open it; when Android asks, allow installs from your browser or Files app.
+3. In YouTube, tap **Share → U-Download**, then **Download**.
+
+The app tells you when a new version is out, and keeps its download engine
+(yt-dlp) up to date by itself.
+
 ## ✨ Features
 
 ### Download Options
