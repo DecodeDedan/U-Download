@@ -33,7 +33,19 @@ export default function Splash({ onDone }) {
           { scaleX: 0, transformOrigin: "left center", duration: SPLASH_MS / 1000 - 0.9, ease: "power1.inOut" },
           0.4,
         )
-        .to(root.current, { opacity: 0, duration: FADE_OUT_S, ease: "power1.in" }, SPLASH_MS / 1000 - FADE_OUT_S);
+        .to(
+          root.current,
+          {
+            opacity: 0,
+            duration: FADE_OUT_S,
+            ease: "power1.in",
+            // Once the app shows through, taps belong to it, not the fading splash.
+            onStart: () => {
+              if (root.current) root.current.style.pointerEvents = "none";
+            },
+          },
+          SPLASH_MS / 1000 - FADE_OUT_S,
+        );
     }, root);
 
     return () => {
