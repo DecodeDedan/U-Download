@@ -58,13 +58,19 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install the NDK
+      # The runner image ships the Android SDK. android-actions/setup-android
+      # is not used: v3 asks sdkmanager for the long-removed 'tools' package
+      # and fails against cmdline-tools 16.
+      - name: Install Android SDK packages
         run: |
-          sdkmanager --install "ndk;${NDK_VERSION}"
-          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          SDKMANAGER=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
+          echo "Using $SDKMANAGER"
+          # `yes` ends on SIGPIPE once sdkmanager stops reading; that is not a failure.
+          set +o pipefail
+          yes | "$SDKMANAGER" --licenses > /dev/null
+          set -o pipefail
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;${NDK_VERSION}"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
