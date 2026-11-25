@@ -338,12 +338,9 @@ checksum_source() {
       echo "sha256:https://curl.se/ca/cacert.pem.sha256"
       ;;
     deno)
-      # deno publishes a per-asset "<asset-name>.sha256sum" file alongside
-      # every release zip, in the same "<hash>  <filename>" format as
-      # sha256sum's own output — confirmed live via the GitHub releases
-      # API and by fetching the file for every platform this script
-      # targets. Reuse the exact same asset URL, just with an extra
-      # ".sha256sum" suffix.
+      # deno publishes a per-asset "<asset-name>.sha256sum" beside every zip.
+      # Linux and macOS files are "<hash>  <filename>". The Windows file is
+      # PowerShell Get-FileHash output; verify_checksum_for() reads that too.
       echo "sha256:$(deno_url).sha256sum"
       ;;
     *)
@@ -380,12 +377,21 @@ verify_checksum_for() {
   # that `set -e`/`pipefail` don't abort this bare assignment before the
   # check runs and can print a proper fail() message.
   expected="$(grep -E "[[:space:]]\*?${match_name_re}\$" "$sums_file" | head -n 1 | awk '{print $1}' || true)"
+  if [ -z "$expected" ] && grep -F -q "$match_name" "$sums_file"; then
+    # denoland's Windows .sha256sum is PowerShell Get-FileHash output, not
+    # "hash  filename":
+    #   Hash      : <64 hex>
+    #   Path      : C:\...\deno-x86_64-pc-windows-msvc.zip
+    expected="$(sed -n 's/^Hash[[:space:]]*:[[:space:]]*\([A-Fa-f0-9]\{64\}\).*/\1/p' "$sums_file" | head -n 1 || true)"
+  fi
   if [ -z "$expected" ]; then
     fail "Could not find a checksum entry for '$match_name' in $sums_url — refusing to trust an unverifiable download."
   fi
 
   local actual
   actual="$(compute_hash "$algo" "$local_file")"
+  expected="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
+  actual="$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')"
   if [ "$expected" != "$actual" ]; then
     fail "Checksum mismatch for $tool asset '$match_name': expected $algo $expected, got $actual. Refusing to install a corrupted or tampered download."
   fi

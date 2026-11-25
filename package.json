@@ -3,7 +3,7 @@
   "private": true,
   "description": "Root of the Tauri app. The interface lives in web/; these scripts forward there so the Tauri CLI and the Android Gradle build (which runs `npm run -- tauri ...` here) work from this folder.",
   "scripts": {
-    "tauri": "web/node_modules/.bin/tauri",
+    "tauri": "npm --prefix web exec -- tauri",
     "build": "npm --prefix web run build",
     "dev": "npm --prefix web run dev"
   }
