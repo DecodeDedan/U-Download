@@ -1,0 +1,75 @@
+[package]
+name = "u-download"
+version = "4.0.0"
+description = "Video, file and torrent downloader for desktop and Android"
+authors = ["Dedan Okware<softengde@gmail.com>"]
+edition = "2021"
+license = "MIT"
+homepage = "https://github.com/okwareddevnet/u-download"
+repository = "https://github.com/okwareddevnet/u-download"
+keywords = ["downloader", "yt-dlp", "aria2", "torrent", "rust"]
+categories = ["multimedia", "gui"]
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "u_download_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# protocol-asset: the preview copy yt-dlp saves is played from the app cache.
+tauri = { version = "2.0", features = ["tray-icon", "wry", "protocol-asset"], default-features = false }
+tauri-plugin-opener = { version = "2.0", default-features = false }
+tauri-plugin-store = { version = "2.0", default-features = false }
+tauri-plugin-dialog = { version = "2.3", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+regex = "1"
+tauri-plugin-notification = { version = "2", default-features = false }
+url = "2.4"
+percent-encoding = "2"
+uuid = { version = "1.25.0", features = ["v4"] }
+
+# Used only to signal a whole process group on cancel. yt-dlp is not the
+# process doing the downloading — ffmpeg (trimmed jobs) and aria2c (untrimmed
+# ones) are its children — so killing the direct child alone leaves the real
+# worker running. See `src/proc.rs`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The Android download engine (youtubedl-android, the engine Seal uses). It
+# lives in its own crate because tauri-build only links a plugin's Kotlin
+# module through a dependency that declares `links`.
+[target.'cfg(target_os = "android")'.dependencies]
+tauri-plugin-udl-engine = { path = "crates/tauri-plugin-udl-engine" }
+
+# Self-update from GitHub Releases. Desktop only: an APK cannot replace itself.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"
+# Relaunches the app once an update is installed.
+tauri-plugin-process = "2"
+# The native segmented engine for direct file links (accel). Same client and
+# TLS stack the updater already pulls in, so this adds no new crates there.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+
+# `--screenshot`: WKWebView renders its own picture, no Screen Recording
+# permission needed. See src/snapshot.rs.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSData", "NSError", "NSDictionary", "NSString"] }
+objc2-app-kit = { version = "0.3", features = ["NSImage", "NSImageRep", "NSBitmapImageRep"] }
+objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKSnapshotConfiguration", "block2", "objc2-app-kit"] }
+
+# The interface is bundled into every build, including a plain `cargo build`,
+# which is how Craft Anything and the --screenshot/--self-test checks run it.
+# For hot reload against the Vite dev server: `cargo tauri dev --no-default-features`.
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

@@ -1,7 +1,7 @@
 name: release-android
 
-# The Android app ships on its own version line (1.x, set in
-# src-tauri/tauri.android.conf.json) and its own tags, `android-vX.Y.Z`,
+# The Android app ships on its own version line (2.x, set in
+# tauri.android.conf.json) and its own tags, `android-vX.Y.Z`,
 # independent of desktop releases (`vX.Y.Z`, release.yml).
 #
 # Two GitHub releases are written:
@@ -40,7 +40,7 @@ jobs:
 
       - name: Check the tag matches the app version
         run: |
-          VERSION=$(node -p "require('./src-tauri/tauri.android.conf.json').version")
+          VERSION=$(node -p "require('./tauri.android.conf.json').version")
           if [ "android-v$VERSION" != "$TAG" ]; then
             echo "::error::tag $TAG does not match tauri.android.conf.json version $VERSION"
             exit 1
@@ -78,7 +78,7 @@ jobs:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
 
       - name: Install frontend dependencies
-        run: npm ci
+        run: npm ci --prefix web
 
       # Fails the job rather than publishing an APK no phone will install.
       - name: Restore the release keystore
@@ -105,7 +105,7 @@ jobs:
 
       - name: Collect APKs and checksums
         run: |
-          OUT=src-tauri/gen/android/app/build/outputs/apk
+          OUT=gen/android/app/build/outputs/apk
           mkdir -p dist-android
           cp "$OUT/universal/release/app-universal-release.apk" "dist-android/U-Download-Android-$VERSION.apk"
           for pair in arm64:arm64-v8a arm:armeabi-v7a x86_64:x86_64; do
@@ -128,7 +128,7 @@ jobs:
             echo "Install: open the APK on your phone and allow installs from this source when asked."
             echo
             echo "### Changes"
-            git log --pretty='- %s' "$RANGE" -- src src-tauri | head -60
+            git log --pretty='- %s' "$RANGE" -- src web/src gen/android crates | head -60
           } > NOTES.md
           cat NOTES.md
 

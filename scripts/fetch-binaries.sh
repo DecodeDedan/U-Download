@@ -2,7 +2,7 @@
 #
 # fetch-binaries.sh — download yt-dlp, ffmpeg, aria2c, a CA certificate
 # bundle (cacert.pem) and (optionally) deno into
-# src-tauri/binaries/<platform>/ so the Tauri build can bundle them.
+# binaries/<platform>/ so the Tauri build can bundle them.
 #
 # Binaries are no longer stored in Git (the LFS budget for this repo is
 # exhausted); they are fetched from upstream release infrastructure at
@@ -132,7 +132,7 @@ case "$PLATFORM" in
   *) fail "Internal error: unrecognized platform '$PLATFORM'" ;;
 esac
 
-BIN_DIR="$REPO_ROOT/src-tauri/binaries/$PLATFORM"
+BIN_DIR="$REPO_ROOT/binaries/$PLATFORM"
 mkdir -p "$BIN_DIR"
 
 EXE_SUFFIX=""

@@ -16,11 +16,11 @@ Download YouTube videos and audio instantly - no installation of external tools 
 
 ## 📥 Download & Install
 
-**Latest Version: v2.2.5** (October 2025)
+**Latest Version: v4.0.0** (November 2026)
 
 ### Quick Links
-- **Latest Release**: https://github.com/okwareddevnet/u-download/releases/latest
-- **v2.2.5 Release**: https://github.com/okwareddevnet/u-download/releases/tag/v2.2.5
+- **Latest Release**: https://github.com/DecodeDedan/U-Download/releases/latest
+- **v4.0.0 Release**: https://github.com/DecodeDedan/U-Download/releases/tag/v4.0.0
 
 ### Installation by Platform
 
@@ -60,7 +60,7 @@ that the app updates itself.
 > then go to System Settings → Privacy & Security and click **Open Anyway**.
 
 #### Android (7.0 and newer)
-The Android app has its own version line (1.x) and releases
+The Android app has its own version line (2.x) and releases
 ([`android-v*`](https://github.com/DecodeDedan/U-Download/releases?q=android-v&expanded=true)).
 
 **Download:** https://github.com/DecodeDedan/U-Download/releases/download/android-latest/U-Download-Android.apk
@@ -167,9 +167,9 @@ cd ~/Downloads/
 
 ### Still Having Issues?
 
-1. **Check for updates**: Visit the [releases page](https://github.com/okwareddevnet/u-download/releases)
+1. **Check for updates**: Visit the [releases page](https://github.com/DecodeDedan/U-Download/releases)
 2. **View bundled tools**: Click "Check Dependencies" button in the app
-3. **Report bugs**: Open an [issue on GitHub](https://github.com/okwareddevnet/u-download/issues)
+3. **Report bugs**: Open an [issue on GitHub](https://github.com/DecodeDedan/U-Download/issues)
 
 ## 📚 Documentation
 

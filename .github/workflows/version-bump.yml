@@ -29,9 +29,10 @@ jobs:
         with:
           node-version: 'lts/*'
           cache: 'npm'
+          cache-dependency-path: web/package-lock.json
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --prefix web
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -49,14 +50,12 @@ jobs:
 
       - name: Bump version
         run: |
-          npm version ${{ github.event.inputs.version_type }} --no-git-tag-version
-          NEW_VERSION=$(node -pe "require('./package.json').version")
-          cd src-tauri
+          npm --prefix web version ${{ github.event.inputs.version_type }} --no-git-tag-version
+          NEW_VERSION=$(node -pe "require('./web/package.json').version")
           cargo set-version $NEW_VERSION
-          cd ..
-          
+
           # Update tauri.conf.json version
-          sed -i "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" src-tauri/tauri.conf.json
+          sed -i "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" tauri.conf.json
           
           echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
 

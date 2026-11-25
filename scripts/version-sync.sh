@@ -39,7 +39,7 @@ fi
 
 # Update package.json (skip if already at target version)
 if command -v npm >/dev/null 2>&1; then
-    cd "$ROOT_DIR"
+    cd "$ROOT_DIR/web"
     CUR_VER=$(node -p "require('./package.json').version" 2>/dev/null || echo "")
     if [ "$CUR_VER" = "$NEW_VERSION" ]; then
         echo "✓ package.json already at $NEW_VERSION"
@@ -52,9 +52,9 @@ else
 fi
 
 # Update Cargo.toml
-CARGO_TOML="$ROOT_DIR/src-tauri/Cargo.toml"
+CARGO_TOML="$ROOT_DIR/Cargo.toml"
 if [ -f "$CARGO_TOML" ]; then
-    cd "$ROOT_DIR/src-tauri"
+    cd "$ROOT_DIR"
     if command -v cargo >/dev/null 2>&1 && cargo --list 2>/dev/null | grep -q "set-version"; then
         cargo set-version "$NEW_VERSION"
         echo "✓ Updated Cargo.toml"
@@ -69,7 +69,7 @@ else
 fi
 
 # Update tauri.conf.json
-TAURI_CONF="$ROOT_DIR/src-tauri/tauri.conf.json"
+TAURI_CONF="$ROOT_DIR/tauri.conf.json"
 if [ -f "$TAURI_CONF" ]; then
     if command -v jq >/dev/null 2>&1; then
         jq ".version = \"$NEW_VERSION\"" "$TAURI_CONF" > "$TAURI_CONF.tmp" && mv "$TAURI_CONF.tmp" "$TAURI_CONF"

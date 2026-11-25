@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Generate square 256x256 and 512x512 icons for Tauri bundler
-// Uses src-tauri/icons/icon.png (preferred) or ./logo.png as source
+// Uses icons/icon.png (preferred) or ./logo.png as source
 
 const fs = require('fs');
 const path = require('path');
@@ -28,7 +28,7 @@ async function createSquareIcon(srcPath, outPath, size) {
 
 (async () => {
   try {
-    const iconsDir = path.join(__dirname, '..', 'src-tauri', 'icons');
+    const iconsDir = path.join(__dirname, '..', 'icons');
     const srcCandidates = [
       path.join(iconsDir, 'icon.png'),
       path.join(__dirname, '..', 'logo.png'),
@@ -38,7 +38,7 @@ async function createSquareIcon(srcPath, outPath, size) {
       if (fs.existsSync(p)) { src = p; break; }
     }
     if (!src) {
-      console.error('No source image found. Expected src-tauri/icons/icon.png or ./logo.png');
+      console.error('No source image found. Expected icons/icon.png or ./logo.png');
       process.exit(1);
     }
 

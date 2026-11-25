@@ -85,7 +85,7 @@ jobs:
             xdg-utils
 
       - name: Install frontend dependencies
-        run: npm ci
+        run: npm ci --prefix web
 
       - name: Fetch bundled binaries (yt-dlp, ffmpeg, aria2c)
         shell: bash

@@ -1,0 +1,952 @@
+//! Executes queued jobs as yt-dlp child processes and reports their progress.
+//!
+//! Two invariants govern everything here:
+//!
+//! 1. **The registry mutex is never held across a blocking or slow call.**
+//!    `SharedJobs` is a single `Mutex` shared by every download thread, the
+//!    scheduler and all five Tauri commands. Holding it across `Child::wait`,
+//!    `Command::spawn` or a webview `emit` would stall every other job's
+//!    progress update. Each lock scope below is a few map lookups, and the
+//!    comment on it says what it covers.
+//! 2. **A job is claimed before its thread starts.** See `pump`.
+
+use crate::jobs::{Job, JobId, JobProgress, JobStatus, SharedJobs};
+use crate::queue;
+use crate::router::LinkKind;
+use crate::ytdlp::{build_download_args, output_template, parse_progress_line, DownloadSpec, Toolchain};
+use std::path::{Path, PathBuf};
+use tauri::{Emitter, Runtime, Window};
+#[cfg(not(target_os = "android"))]
+use {
+    crate::{binary_manager, proc},
+    std::io::Read,
+    std::process::{Command, Stdio},
+};
+
+/// Emits at most one progress event per job per interval, so several concurrent
+/// downloads cannot flood the webview bridge.
+const PROGRESS_EMIT_INTERVAL_MS: u128 = 500;
+
+/// The per-run inputs that do not live in the job registry.
+///
+/// Bundled as one value because `pump` and `run_job` hand them to each other
+/// recursively; five loose `PathBuf`/`u32` arguments were easy to transpose.
+#[derive(Debug, Clone)]
+pub struct RunnerContext {
+    #[cfg(not(target_os = "android"))]
+    pub yt_dlp: PathBuf,
+    #[cfg(not(target_os = "android"))]
+    pub binaries_dir: PathBuf,
+    /// Torrents, magnets and FTP run through it directly.
+    #[cfg(not(target_os = "android"))]
+    pub aria2c: PathBuf,
+    #[cfg(not(target_os = "android"))]
+    pub ca_bundle: Option<String>,
+    /// The native engine's connection count and the shared speed limit.
+    #[cfg(not(target_os = "android"))]
+    pub accel: AccelContext,
+    /// How ffmpeg, the JS runtime and aria2c are named to yt-dlp here.
+    pub toolchain: Toolchain,
+    pub concurrency: u32,
+    /// Bytes per second for yt-dlp's own `-r`; 0 is unlimited.
+    pub rate_limit: u64,
+}
+
+#[cfg(not(target_os = "android"))]
+#[derive(Clone)]
+pub struct AccelContext {
+    pub settings: crate::accel::Settings,
+    pub limiter: std::sync::Arc<crate::accel::Limiter>,
+}
+
+#[cfg(not(target_os = "android"))]
+impl std::fmt::Debug for AccelContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccelContext")
+            .field("settings", &self.settings)
+            .field("limit", &self.limiter.rate())
+            .finish()
+    }
+}
+
+/// How one download ended, from the runner's point of view.
+///
+/// `None` from an executor means a cancel or pause took the job over and has
+/// already published its own state, so the runner must report nothing.
+type Finished = Option<Result<Option<String>, String>>;
+
+/// Sends the current state of one job to the frontend.
+///
+/// The lock is dropped before `emit`: serialising into the webview bridge is
+/// not something the registry mutex should ever be held across.
+pub fn emit_job<R: Runtime>(window: &Window<R>, jobs: &SharedJobs, id: &JobId) {
+    let job = { jobs.lock().unwrap().get(id) };
+    if let Some(job) = job {
+        let _ = window.emit("job-updated", job);
+    }
+}
+
+/// Marks a job failed and tells the frontend, in that order.
+fn fail<R: Runtime>(window: &Window<R>, jobs: &SharedJobs, id: &JobId, message: String) {
+    {
+        // Lock scope: one map write.
+        jobs.lock().unwrap().set_error(id, message.clone());
+    }
+    emit_job(window, jobs, id);
+    let _ = window.emit(
+        "job-failed",
+        serde_json::json!({ "job_id": id, "error": message }),
+    );
+}
+
+/// Recognises the lines on which yt-dlp names the file it is writing.
+///
+/// Reading yt-dlp's own report is what replaces the previous implementation's
+/// directory scan for a name containing `_temp`, which could match — and then
+/// overwrite — an unrelated file. Later lines win: for a merged download the
+/// per-stream `Destination:` lines come first and `[Merger]` names the real
+/// result, and for audio extraction `[ExtractAudio]` follows the container
+/// download the same way.
+fn destination_from_line(line: &str) -> Option<String> {
+    #[cfg(not(target_os = "android"))]
+    if let Some(path) = crate::torrent::completed_path(line) {
+        return Some(path);
+    }
+    // `[MoveFiles] Moving file "<temp>" to "<final>"`: the last word on where
+    // the file lives when yt-dlp stages work in a temp dir (Android).
+    if let Some(rest) = line.strip_prefix("[MoveFiles] Moving file ") {
+        let target = rest.rsplit_once("\" to \"")?.1.trim_end().trim_end_matches('"');
+        return (!target.is_empty()).then(|| target.to_string());
+    }
+    for prefix in [
+        "[download] Destination: ",
+        "[ExtractAudio] Destination: ",
+        "[Merger] Merging formats into ",
+    ] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            let path = rest.trim().trim_matches('"');
+            if !path.is_empty() {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Splits a byte stream into records on either `\n` or `\r`.
+///
+/// yt-dlp's own progress lines are newline-terminated — we pass `--newline` —
+/// but they are not what an untrimmed job produces. yt-dlp hands those to
+/// aria2c, and although it disables aria2c's periodic summary
+/// (`--summary-interval=0`, `--download-result=hide`) it keeps the live
+/// single-line readout (`--show-console-readout=true`). aria2c redraws that
+/// readout with a carriage return and never terminates it with a newline, so a
+/// line-oriented reader sees one enormous record at end of stream and the user
+/// watches 0% until the download finishes.
+///
+/// Empty records are dropped. That is also what stops a `\r\n` pair from
+/// producing a spurious blank record between its two bytes — and a blank
+/// record is not something either parser could use anyway.
+#[cfg(not(target_os = "android"))]
+#[derive(Default)]
+struct RecordSplitter {
+    pending: Vec<u8>,
+}
+
+#[cfg(not(target_os = "android"))]
+impl RecordSplitter {
+    /// Feeds one chunk of bytes and returns every record it completed.
+    ///
+    /// A record straddling two chunks stays in `pending` until the delimiter
+    /// arrives, so chunk boundaries are invisible to the caller.
+    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        let mut records = Vec::new();
+        for &byte in chunk {
+            if byte == b'\n' || byte == b'\r' {
+                if let Some(record) = self.take_pending() {
+                    records.push(record);
+                }
+            } else {
+                self.pending.push(byte);
+            }
+        }
+        records
+    }
+
+    /// Takes whatever is buffered but not yet terminated.
+    ///
+    /// Called once at end of stream, where it is not an edge case: aria2c's
+    /// last readout never gets a terminator, so this is how the final progress
+    /// update arrives.
+    fn take_pending(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let record = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        Some(record)
+    }
+}
+
+/// Turns one parsed progress record into a percentage, or `None` if it carries
+/// no usable one.
+///
+/// ffmpeg — the downloader on every trimmed job — reports a position on the
+/// media timeline and no percentage at all, because it does not know how long
+/// the requested section is. This function does: `section_seconds` is the span
+/// of the job's own trim range. Without this the whole trim path reported 0%
+/// until the runner force-wrote 100 at the end.
+///
+/// An ffmpeg position with no known section length yields `None` rather than
+/// 0.0: an untrimmed job's post-download merge also prints these lines, and
+/// writing 0% there would undo the real progress aria2c had already reported.
+fn percentage_from(p: &crate::ytdlp::ProgressLine, section_seconds: Option<f64>) -> Option<f64> {
+    match p.out_time_seconds {
+        None => Some(p.percentage),
+        Some(position) => match section_seconds {
+            Some(total) if total > 0.0 => Some((position / total * 100.0).clamp(0.0, 100.0)),
+            _ => None,
+        },
+    }
+}
+
+/// Applies one record of downloader output to the job.
+///
+/// Split out so the reader loop and the end-of-stream fragment go through
+/// exactly the same path.
+fn consume_record<R: Runtime>(
+    window: &Window<R>,
+    jobs: &SharedJobs,
+    id: &JobId,
+    record: &str,
+    output_path: &mut Option<String>,
+    last_emit: &mut std::time::Instant,
+    section_seconds: Option<f64>,
+) {
+    if let Some(path) = destination_from_line(record) {
+        *output_path = Some(path);
+        return;
+    }
+
+    let Some(p) = parse_progress_line(record) else {
+        return;
+    };
+
+    let Some(percentage) = percentage_from(&p, section_seconds) else {
+        return;
+    };
+
+    let total_bytes = p.total_bytes.unwrap_or(0);
+    {
+        // Lock scope: one map write, once per progress record.
+        jobs.lock().unwrap().update_progress(
+            id,
+            JobProgress {
+                percentage,
+                speed_bytes_per_sec: p.speed_bytes_per_sec.unwrap_or(0),
+                eta_seconds: p.eta_seconds,
+                bytes_downloaded: (total_bytes as f64 * percentage / 100.0) as u64,
+                total_bytes,
+                ..JobProgress::default()
+            },
+        );
+    }
+
+    let due = last_emit.elapsed().as_millis() >= PROGRESS_EMIT_INTERVAL_MS;
+    if due || percentage >= 100.0 {
+        emit_job(window, jobs, id);
+        *last_emit = std::time::Instant::now();
+    }
+}
+
+/// Runs one job to completion on a blocking thread.
+///
+/// The caller (`pump`) has already moved the job out of `Queued`, so this
+/// function owns the concurrency slot from its first line.
+pub fn run_job<R: Runtime>(window: Window<R>, jobs: SharedJobs, id: JobId, ctx: RunnerContext) {
+    // Lock scope: copy the job's inputs out. Everything below works from the
+    // copy, so the registry stays free while the download runs.
+    let job = match { jobs.lock().unwrap().get(&id) } {
+        // Anything other than the claim `pump` just made means the job was
+        // cancelled or paused between dispatch and this thread starting.
+        Some(job) if job.status == JobStatus::Probing => job,
+        _ => return,
+    };
+
+    let finished = match job.kind {
+        LinkKind::Media | LinkKind::Search => run_media(&window, &jobs, &id, &ctx, &job),
+        #[cfg(not(target_os = "android"))]
+        LinkKind::File => run_file(&window, &jobs, &id, &ctx, &job),
+        // youtubedl-android's generic extractor fetches a direct link through
+        // its bundled aria2c, with the same 16 connections.
+        #[cfg(target_os = "android")]
+        LinkKind::File => run_media(&window, &jobs, &id, &ctx, &job),
+        #[cfg(not(target_os = "android"))]
+        LinkKind::Torrent => {
+            let args = crate::torrent::build_args(&job.url, &job.output_folder, ctx.ca_bundle.as_deref());
+            execute(&window, &jobs, &id, &ctx, &ctx.aria2c, &args, None)
+        }
+        #[cfg(target_os = "android")]
+        LinkKind::Torrent => Some(Err(
+            "Torrents and magnet links download in the desktop app; the phone engine has no BitTorrent support yet".to_string(),
+        )),
+    };
+    let Some(result) = finished else {
+        return;
+    };
+    report(&window, &jobs, &id, result);
+}
+
+/// A media page through yt-dlp.
+fn run_media<R: Runtime>(
+    window: &Window<R>,
+    jobs: &SharedJobs,
+    id: &JobId,
+    ctx: &RunnerContext,
+    job: &Job,
+) -> Finished {
+    let spec = DownloadSpec {
+        url: job.url.clone(),
+        format: job.format.clone(),
+        trim: job.trim,
+        output_template: output_template(&job.output_folder, &job.options),
+        options: job.options.clone(),
+    };
+
+    // Trimming lives entirely in these arguments (`--download-sections` plus
+    // `--force-keyframes-at-cuts`). There is deliberately no FFmpeg post-pass:
+    // the `-c copy` cut it used to perform could only land on a keyframe.
+    let toolchain = ctx.toolchain.for_job(id);
+    let mut args = build_download_args(&spec, &toolchain);
+    if ctx.rate_limit > 0 {
+        // Before the URL, which is always last.
+        let at = args.len().saturating_sub(1);
+        args.splice(at..at, ["-r".to_string(), ctx.rate_limit.to_string()]);
+    }
+
+    // The span of the requested section, which is what ffmpeg's timeline
+    // progress has to be measured against on a trimmed job. `None` for an
+    // untrimmed one, where progress is byte-based and this is not consulted.
+    let section_seconds = spec
+        .trim
+        .map(|range| range.end - range.start)
+        .filter(|span| *span > 0.0);
+
+    #[cfg(not(target_os = "android"))]
+    let finished = execute(window, jobs, id, ctx, &ctx.yt_dlp, &args, section_seconds);
+    #[cfg(target_os = "android")]
+    let finished = execute(window, jobs, id, ctx, Path::new("yt-dlp"), &args, section_seconds);
+    // Whatever happened, nothing in the job's scratch directory is still
+    // needed: the finished file has already been moved out of it.
+    if let Some(dir) = toolchain.job_temp_dir() {
+        if let Err(e) = std::fs::remove_dir_all(dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("Could not clear temp files for job {id}: {e}");
+            }
+        }
+    }
+    finished
+}
+
+/// A direct file link through the native segmented engine.
+#[cfg(not(target_os = "android"))]
+fn run_file<R: Runtime>(
+    window: &Window<R>,
+    jobs: &SharedJobs,
+    id: &JobId,
+    ctx: &RunnerContext,
+    job: &Job,
+) -> Finished {
+    use crate::accel::{self, Outcome};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    let stop: crate::jobs::StopFlag = Arc::new(AtomicBool::new(false));
+    // Lock scope: the conditional promotion and the stop flag, together, so
+    // no cancel can see a Downloading job it has no way to stop.
+    let promoted = {
+        let mut reg = jobs.lock().unwrap();
+        let promoted = queue::promote_to_downloading(&mut reg, id);
+        if promoted {
+            reg.attach_stop(id, stop.clone());
+        }
+        promoted
+    };
+    if !promoted {
+        return None;
+    }
+    emit_job(window, jobs, id);
+
+    let file_name = Mutex::new(String::new());
+    let folder = PathBuf::from(&job.output_folder);
+    let outcome = tauri::async_runtime::block_on(accel::download(
+        &job.url,
+        &folder,
+        &ctx.accel.settings,
+        ctx.accel.limiter.clone(),
+        stop,
+        |t| {
+            if let Ok(mut name) = file_name.lock() {
+                if name.is_empty() {
+                    name.clone_from(&t.file_name);
+                }
+            }
+            let total = t.total.unwrap_or(0);
+            let percentage = if total > 0 { t.downloaded as f64 * 100.0 / total as f64 } else { 0.0 };
+            {
+                // Lock scope: two map writes, twice a second.
+                let mut reg = jobs.lock().unwrap();
+                if reg.get(id).is_some_and(|j| j.title.is_empty()) {
+                    reg.set_metadata(id, &t.file_name, "");
+                }
+                reg.update_progress(
+                    id,
+                    JobProgress {
+                        percentage,
+                        speed_bytes_per_sec: t.speed,
+                        eta_seconds: t.eta,
+                        bytes_downloaded: t.downloaded,
+                        total_bytes: total,
+                        connections: t.connections,
+                        pieces: t.pieces,
+                    },
+                );
+            }
+            emit_job(window, jobs, id);
+        },
+    ));
+
+    // Lock scope: one read. A pause keeps the partial file for the resume;
+    // a cancel throws it away.
+    let status = { jobs.lock().unwrap().get(id).map(|j| j.status) };
+    if status != Some(JobStatus::Downloading) {
+        if status == Some(JobStatus::Cancelled) {
+            let name = file_name.lock().map(|n| n.clone()).unwrap_or_default();
+            if !name.is_empty() {
+                accel::discard_partial(&folder, &name);
+            }
+        }
+        return None;
+    }
+    Some(match outcome {
+        Ok(Outcome::Done(path)) => Ok(Some(path.to_string_lossy().into_owned())),
+        Ok(Outcome::Cancelled) => Err("The download was stopped before it finished".to_string()),
+        Err(e) => Err(e),
+    })
+}
+
+/// Publishes how a run ended.
+fn report<R: Runtime>(window: &Window<R>, jobs: &SharedJobs, id: &JobId, result: Result<Option<String>, String>) {
+    match result {
+        Ok(output_path) => {
+            let finished = {
+                // Lock scope: the completion writes, then one read to build
+                // the event payload.
+                let mut reg = jobs.lock().unwrap();
+                if let Some(path) = output_path {
+                    reg.set_output_path(id, PathBuf::from(path));
+                }
+                let mut progress = reg.get(id).map(|job| job.progress).unwrap_or_default();
+                progress.percentage = 100.0;
+                progress.speed_bytes_per_sec = 0;
+                progress.eta_seconds = Some(0);
+                progress.bytes_downloaded = progress.total_bytes;
+                progress.connections = 0;
+                progress.pieces = vec![100; progress.pieces.len()];
+                reg.update_progress(id, progress);
+                reg.set_status(id, JobStatus::Done);
+                reg.get(id)
+            };
+
+            if let Some(job) = finished {
+                let _ = window.emit("job-updated", &job);
+                let _ = window.emit(
+                    "job-done",
+                    serde_json::json!({
+                        "job_id": id,
+                        "output_path": job.output_path,
+                        "title": job.title,
+                    }),
+                );
+            }
+        }
+        Err(message) => fail(window, jobs, id, message),
+    }
+}
+
+/// Runs yt-dlp as a child process group and reads its progress.
+#[cfg(not(target_os = "android"))]
+fn execute<R: Runtime>(
+    window: &Window<R>,
+    jobs: &SharedJobs,
+    id: &JobId,
+    ctx: &RunnerContext,
+    program: &Path,
+    args: &[String],
+    section_seconds: Option<f64>,
+) -> Finished {
+    let tool = program.file_stem().and_then(|s| s.to_str()).unwrap_or("downloader").to_string();
+    let mut cmd = Command::new(program);
+    binary_manager::augment_path_env(&mut cmd, &ctx.binaries_dir);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // So that cancelling reaches the process actually doing the download —
+    // ffmpeg on a trimmed job, aria2c otherwise — and not just yt-dlp.
+    proc::spawn_in_own_process_group(&mut cmd);
+
+    // Spawned with no lock held.
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return Some(Err(format!("Failed to start {tool}: {e}")));
+        }
+    };
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    // Drained on its own thread. Reading stderr only after stdout closes would
+    // deadlock the moment yt-dlp writes more warnings than the pipe buffer
+    // holds, because it would then block before finishing its stdout output.
+    //
+    // It is also where a trimmed job's progress lives. ffmpeg writes its
+    // `frame=… time=…` readout to stderr, not stdout, and on the
+    // `--download-sections` path ffmpeg is the only thing reporting anything —
+    // so parsing the ffmpeg line shape without also routing stderr through the
+    // parser would leave the trim path exactly as blind as before. The same
+    // `RecordSplitter` is used because ffmpeg redraws that readout with a
+    // carriage return, just as aria2c does.
+    let stderr_reader = stderr.map(|mut stderr| {
+        let (window, jobs, id) = (window.clone(), jobs.clone(), id.clone());
+        std::thread::spawn(move || {
+            let mut raw: Vec<u8> = Vec::new();
+            let mut splitter = RecordSplitter::default();
+            let mut chunk = [0u8; 4096];
+            let mut last_emit = std::time::Instant::now();
+            // yt-dlp names its output file on stdout, never here; this exists
+            // only to satisfy the shared signature and is intentionally dropped.
+            let mut ignored_path: Option<String> = None;
+
+            loop {
+                let read = match stderr.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                raw.extend_from_slice(&chunk[..read]);
+                for record in splitter.push(&chunk[..read]) {
+                    consume_record(
+                        &window,
+                        &jobs,
+                        &id,
+                        &record,
+                        &mut ignored_path,
+                        &mut last_emit,
+                        section_seconds,
+                    );
+                }
+            }
+
+            // ffmpeg's last readout, like aria2c's, has no terminator.
+            if let Some(record) = splitter.take_pending() {
+                consume_record(
+                    &window,
+                    &jobs,
+                    &id,
+                    &record,
+                    &mut ignored_path,
+                    &mut last_emit,
+                    section_seconds,
+                );
+            }
+
+            // Decoded once at the end rather than per chunk, so a multi-byte
+            // character straddling a chunk boundary is not mangled in the text
+            // that becomes the user-visible error message.
+            String::from_utf8_lossy(&raw).into_owned()
+        })
+    });
+
+    // Lock scope: one read and two writes. The promotion is conditional
+    // because `cancel_job`/`pause_job` can land in the window that spans
+    // `cmd.spawn()` and this point — milliseconds, not microseconds. Such a
+    // caller finds no child to kill (it has not been attached yet) and writes
+    // only its own terminal status; promoting unconditionally would erase it
+    // and the download would run to completion and report Done, with the
+    // user's cancel silently discarded.
+    let orphan = {
+        let mut reg = jobs.lock().unwrap();
+        if queue::promote_to_downloading(&mut reg, id) {
+            // Attached in the same scope as the promotion, so no other caller
+            // can observe a Downloading job with no cancellable process.
+            reg.attach_child(id, child);
+            None
+        } else {
+            Some(child)
+        }
+    };
+
+    if let Some(mut child) = orphan {
+        // The job was taken from us before we could attach the process, so
+        // nobody else can kill it. Killed and reaped here, outside the lock.
+        // The status the other caller published stands, and it has already
+        // emitted for it, so this thread reports nothing.
+        proc::kill_tree(&mut child);
+        let _ = child.wait();
+        return None;
+    }
+
+    emit_job(window, jobs, id);
+
+    let mut output_path: Option<String> = None;
+
+    if let Some(mut stdout) = stdout {
+        // Read raw bytes rather than `BufReader::lines()`. aria2c's live
+        // readout is the only progress an untrimmed job produces, and aria2c
+        // redraws it with a carriage return and never terminates it with a
+        // newline — `lines()` would yield nothing at all until the pipe closed
+        // and then replay every update at once, leaving the bar at 0% for the
+        // whole download.
+        let mut splitter = RecordSplitter::default();
+        let mut chunk = [0u8; 4096];
+        let mut last_emit = std::time::Instant::now();
+
+        loop {
+            let read = match stdout.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            for record in splitter.push(&chunk[..read]) {
+                consume_record(
+                    window,
+                    jobs,
+                    id,
+                    &record,
+                    &mut output_path,
+                    &mut last_emit,
+                    section_seconds,
+                );
+            }
+        }
+
+        // aria2c's final readout has no terminator at all, so the last
+        // progress update only exists as this fragment.
+        if let Some(record) = splitter.take_pending() {
+            consume_record(
+                window,
+                jobs,
+                id,
+                &record,
+                &mut output_path,
+                &mut last_emit,
+                section_seconds,
+            );
+        }
+    }
+
+    let stderr_text = stderr_reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+
+    // Lock scope: one map write. Taking the child back out is what lets the
+    // wait below happen with the mutex released. `None` means `cancel` got
+    // there first and has already killed and reaped the process.
+    let child = { jobs.lock().unwrap().take_child(id) };
+    let status = child.map(|mut child| child.wait());
+
+    // Lock scope: one read. `queue::still_running` is false once a cancel or
+    // pause has taken the job over and published its own terminal state; see
+    // its doc comment for why this thread must then report nothing.
+    let still_ours = { queue::still_running(&jobs.lock().unwrap(), id) };
+    if !still_ours {
+        return None;
+    }
+
+    Some(match status {
+        Some(Ok(exit)) if exit.success() => Ok(output_path),
+        Some(Ok(exit)) => {
+            let code = exit.code().unwrap_or(-1);
+            let detail = stderr_text.trim();
+            Err(if detail.is_empty() {
+                format!("{tool} exited with {code}")
+            } else {
+                format!("{tool} exited with {code}: {detail}")
+            })
+        }
+        Some(Err(e)) => Err(format!("Process error: {e}")),
+        // The registry no longer held the child and the job is not cancelled:
+        // the process was reaped by something else, so there is no status to
+        // report. Treat it as a failure rather than silently claiming success.
+        None => Err(format!("{tool} process handle was lost before it could be waited on")),
+    })
+}
+
+/// Runs yt-dlp through the youtubedl-android engine and reads its progress.
+///
+/// The engine streams the same output records a desktop child writes, so they
+/// go through the same `consume_record`. There is no child to attach: a cancel
+/// reaches the engine through `cancel_job`/`pause_job` instead.
+#[cfg(target_os = "android")]
+fn execute<R: Runtime>(
+    window: &Window<R>,
+    jobs: &SharedJobs,
+    id: &JobId,
+    _ctx: &RunnerContext,
+    _program: &Path,
+    args: &[String],
+    section_seconds: Option<f64>,
+) -> Finished {
+    use tauri::Manager;
+    use tauri_plugin_udl_engine::{Engine, Outcome};
+
+    // Lock scope: one conditional status write. Refused when a cancel or
+    // pause landed between the claim and here; that caller has reported.
+    let promoted = { queue::promote_to_downloading(&mut jobs.lock().unwrap(), id) };
+    if !promoted {
+        return None;
+    }
+    emit_job(window, jobs, id);
+
+    let engine = window.state::<Engine<R>>();
+    let mut output_path: Option<String> = None;
+    let mut last_emit = std::time::Instant::now();
+    let outcome = engine.execute(id, args, true, |record| {
+        consume_record(window, jobs, id, record, &mut output_path, &mut last_emit, section_seconds)
+    });
+
+    // Lock scope: one read. See `queue::still_running`.
+    if !{ queue::still_running(&jobs.lock().unwrap(), id) } {
+        return None;
+    }
+
+    Some(match outcome {
+        Outcome::Completed { .. } => {
+            if let Some(path) = &output_path {
+                engine.scan_media(path);
+            }
+            Ok(output_path)
+        }
+        Outcome::Failed { message } => Err(message),
+        // Stopped without the registry knowing, e.g. the OS killed the engine.
+        Outcome::Cancelled => Err("The download was stopped before it finished".to_string()),
+    })
+}
+
+/// Starts every job the scheduler currently permits.
+///
+/// Called on enqueue, on cancel/pause/resume, and by each job thread as it
+/// finishes — so two `pump`s can easily run at once.
+pub fn pump<R: Runtime>(window: Window<R>, jobs: SharedJobs, ctx: RunnerContext) {
+    // Lock scope: the dispatch decision AND the claim that follows from it,
+    // which `queue::claim_next` performs as one operation precisely so they
+    // cannot be split. Nothing is spawned inside the scope.
+    let ready = {
+        let mut reg = jobs.lock().unwrap();
+        queue::claim_next(&mut reg, ctx.concurrency.max(1) as usize)
+    };
+
+    for id in ready {
+        emit_job(&window, &jobs, &id);
+        let (window, jobs, ctx) = (window.clone(), jobs.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            run_job(window.clone(), jobs.clone(), id, ctx.clone());
+            // A finished job frees a slot; start whatever is next.
+            pump(window, jobs, ctx);
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{destination_from_line, percentage_from, RecordSplitter};
+    use crate::ytdlp::parse_progress_line;
+
+    /// Feeds the whole stream as one chunk and closes it.
+    fn split_all(stream: &[u8]) -> Vec<String> {
+        let mut splitter = RecordSplitter::default();
+        let mut records = splitter.push(stream);
+        records.extend(splitter.take_pending());
+        records
+    }
+
+    /// Feeds the stream in the given pieces, so chunk boundaries fall wherever
+    /// the test wants them.
+    fn split_chunks(chunks: &[&[u8]]) -> Vec<String> {
+        let mut splitter = RecordSplitter::default();
+        let mut records = Vec::new();
+        for chunk in chunks {
+            records.extend(splitter.push(chunk));
+        }
+        records.extend(splitter.take_pending());
+        records
+    }
+
+    // aria2c's readout is redrawn with `\r` and never gets a `\n`.
+    #[test]
+    fn splits_records_on_carriage_returns_alone() {
+        assert_eq!(split_all(b"one\rtwo\rthree\r"), vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn splits_records_on_newlines_alone() {
+        assert_eq!(split_all(b"one\ntwo\nthree\n"), vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn treats_crlf_as_one_separator() {
+        assert_eq!(split_all(b"one\r\ntwo\r\n"), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn joins_a_record_split_across_chunk_boundaries() {
+        assert_eq!(
+            split_chunks(&[b"one\rtw", b"o\rthr", b"ee\r"]),
+            vec!["one", "two", "three"]
+        );
+    }
+
+    // A `\r` ending one chunk and the matching `\n` opening the next must not
+    // manufacture a blank record between them.
+    #[test]
+    fn a_crlf_straddling_a_chunk_boundary_is_still_one_separator() {
+        assert_eq!(split_chunks(&[b"one\r", b"\ntwo\r\n"]), vec!["one", "two"]);
+    }
+
+    // This is how the final progress update arrives — aria2c never terminates
+    // its last readout.
+    #[test]
+    fn returns_the_unterminated_trailing_fragment_at_eof() {
+        assert_eq!(split_all(b"one\rtwo\rlast"), vec!["one", "two", "last"]);
+    }
+
+    #[test]
+    fn produces_nothing_from_an_empty_or_blank_stream() {
+        assert!(split_all(b"").is_empty());
+        assert!(split_all(b"\r\n\r\n\n\r").is_empty());
+    }
+
+    // End to end over the splitter: a realistic aria2c readout stream, redrawn
+    // with carriage returns and cut off mid-record at EOF, must yield every
+    // percentage the user should have seen.
+    #[test]
+    fn an_aria2c_readout_stream_yields_every_update() {
+        let stream: &[&[u8]] = &[
+            b"[#f1a2b3 1.0MiB/10MiB(10%) CN:16 DL:1.0MiB ETA:9s]\r[#f1a2b3 5.0MiB/10M",
+            b"iB(50%) CN:16 DL:1.0MiB ETA:5s]\r[#f1a2b3 10MiB/10MiB(100%) CN:16 DL:1.0MiB]",
+        ];
+
+        let percentages: Vec<f64> = split_chunks(stream)
+            .iter()
+            .filter_map(|record| parse_progress_line(record))
+            .map(|p| p.percentage)
+            .collect();
+
+        assert_eq!(percentages, vec![10.0, 50.0, 100.0]);
+    }
+
+    #[test]
+    fn reads_the_plain_download_destination() {
+        assert_eq!(
+            destination_from_line("[download] Destination: /out/Some Video.f137.mp4").as_deref(),
+            Some("/out/Some Video.f137.mp4")
+        );
+    }
+
+    #[test]
+    fn reads_the_merged_destination_without_its_quotes() {
+        assert_eq!(
+            destination_from_line("[Merger] Merging formats into \"/out/Some Video.mp4\"")
+                .as_deref(),
+            Some("/out/Some Video.mp4")
+        );
+    }
+
+    #[test]
+    fn reads_the_extracted_audio_destination() {
+        assert_eq!(
+            destination_from_line("[ExtractAudio] Destination: /out/Some Track.mp3").as_deref(),
+            Some("/out/Some Track.mp3")
+        );
+    }
+
+    // Android stages work in a private temp dir; the file the user gets is
+    // the one yt-dlp moves out of it, named only on this line.
+    #[test]
+    fn the_final_move_out_of_the_temp_dir_names_the_output() {
+        assert_eq!(
+            destination_from_line(
+                "[MoveFiles] Moving file \"/cache/tmp/Me at the zoo.mp4\" to \"/sdcard/Download/U-Download/Me at the zoo.mp4\""
+            )
+            .as_deref(),
+            Some("/sdcard/Download/U-Download/Me at the zoo.mp4")
+        );
+    }
+
+    #[test]
+    fn ignores_progress_and_other_chatter() {
+        assert!(destination_from_line("[download]  42.0% of 10.00MiB at 1.00MiB/s").is_none());
+        assert!(destination_from_line("[MoveFiles] Moving file \"/tmp/a.mp4\"").is_none());
+        assert!(destination_from_line("[youtube] Extracting URL: https://e/v").is_none());
+    }
+
+    fn pct_of(record: &str, section_seconds: Option<f64>) -> Option<f64> {
+        let parsed = parse_progress_line(record)?;
+        percentage_from(&parsed, section_seconds)
+    }
+
+    // The whole of FIX 2: ffmpeg reports a timeline position, the runner owns
+    // the section length, and only together do they make a percentage.
+    #[test]
+    fn an_ffmpeg_position_becomes_a_percentage_of_the_requested_section() {
+        let line = "frame=  150 fps= 36 q=32.0 Lsize=  358KiB time=00:00:05.00 bitrate= 586.2kbits/s speed=1.21x";
+        assert_eq!(pct_of(line, Some(20.0)), Some(25.0));
+    }
+
+    // ffmpeg can overshoot the requested end slightly when it re-encodes the
+    // boundary GOP; a bar past 100% would be a visible defect.
+    #[test]
+    fn an_ffmpeg_overshoot_is_clamped_to_one_hundred() {
+        let line = "frame=  150 fps= 36 q=32.0 size=  358KiB time=00:00:21.00 bitrate=N/A speed=1.21x";
+        assert_eq!(pct_of(line, Some(20.0)), Some(100.0));
+    }
+
+    // An untrimmed job's merge pass also prints ffmpeg readouts. With no
+    // section length there is no percentage to compute, and writing 0 would
+    // wipe out the real progress aria2c had already reported.
+    #[test]
+    fn an_ffmpeg_line_on_an_untrimmed_job_reports_nothing_rather_than_zero() {
+        let line = "frame=  150 fps= 36 q=32.0 size=  358KiB time=00:00:05.00 bitrate=N/A speed=1.21x";
+        assert_eq!(pct_of(line, None), None);
+    }
+
+    // Regression guard: byte-based progress must be passed through untouched,
+    // whether or not a section length happens to be known.
+    #[test]
+    fn byte_based_progress_is_unaffected_by_the_section_length() {
+        let ytdlp = "[download]  42.5% of  120.50MiB at   3.20MiB/s ETA 00:22";
+        assert_eq!(pct_of(ytdlp, None), Some(42.5));
+        assert_eq!(pct_of(ytdlp, Some(20.0)), Some(42.5));
+
+        let aria = "[#f1a2b3 1.2MiB/10MiB(12%) CN:16 DL:2.1MiB ETA:4s]";
+        assert_eq!(pct_of(aria, None), Some(12.0));
+        assert_eq!(pct_of(aria, Some(20.0)), Some(12.0));
+    }
+
+    // End to end over the splitter, as for aria2c: ffmpeg redraws its readout
+    // with carriage returns and leaves the last one unterminated, so every
+    // update must survive that on the way to a percentage.
+    #[test]
+    fn an_ffmpeg_readout_stream_yields_every_update() {
+        let stream: &[&[u8]] = &[
+            b"frame=   0 fps=0.0 q=0.0 size=N/A time=N/A bitrate=N/A speed=N/A\rframe=  25 fps=25 q=28.0 size=  64KiB time=00:00:0",
+            b"1.00 bitrate=N/A speed=1.0x\rframe= 250 fps=25 q=-1.0 Lsize= 640KiB time=00:00:10.00 bitrate=N/A speed=1.0x",
+        ];
+
+        let percentages: Vec<Option<f64>> = split_chunks(stream)
+            .iter()
+            .filter_map(|record| parse_progress_line(record))
+            .map(|p| percentage_from(&p, Some(10.0)))
+            .collect();
+
+        // The `time=N/A` record parses to nothing at all and never reaches here.
+        assert_eq!(percentages, vec![Some(10.0), Some(100.0)]);
+    }
+}

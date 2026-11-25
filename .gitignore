@@ -23,16 +23,24 @@ dist-ssr
 *.sln
 *.sw?
 
-# Tauri
-src-tauri/target
-src-tauri/gen/*
+# Tauri. The app root is this repository (Cargo.toml and tauri.conf.json live here).
+/target/
+/binaries/
+gen/*
 # The Android project is hand-edited (share intent, packaging, signing), so it
 # is tracked; tauri regenerates only the ignored files inside it.
-!src-tauri/gen/android
+!gen/android
 
-# Bundled tool binaries (yt-dlp, ffmpeg, aria2c) are fetched at build time
-# by scripts/fetch-binaries.sh rather than stored in Git/Git LFS.
+# Previous layout. Left ignored so a local src-tauri/target cache is not committed.
+src-tauri/target
+src-tauri/gen/*
+!src-tauri/gen/android
 src-tauri/binaries/
+
+# Local agent caches
+.claude/
+.claude-flow/
+ruvector.db
 
 # Build artifacts
 *.deb
@@ -73,6 +81,9 @@ ehthumbs.db
 scripts/*
 # ...but the build-time binary fetcher must be tracked
 !scripts/fetch-binaries.sh
+!scripts/generate-release-notes.sh
+!scripts/version-sync.sh
+!scripts/make-icons.cjs
 # ...and the updater manifest builder (release.yml) and the macOS installer
 # (linked from the README by raw URL)
 !scripts/updater-manifest.mjs

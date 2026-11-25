@@ -1,65 +1,10 @@
 {
-  "name": "u-download",
+  "name": "u-download-app",
   "private": true,
-  "version": "3.0.4",
-  "type": "module",
-  "description": "Fast, cross-platform YouTube downloader with GUI",
-  "author": "Dedan Okware <softengde@gmail.com>",
-  "license": "MIT",
-  "homepage": "https://github.com/okwareddevnet/u-download",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/okwareddevnet/u-download.git"
-  },
-  "bugs": {
-    "url": "https://github.com/okwareddevnet/u-download/issues"
-  },
-  "keywords": [
-    "youtube",
-    "downloader",
-    "desktop",
-    "tauri",
-    "rust",
-    "react"
-  ],
+  "description": "Root of the Tauri app. The interface lives in web/; these scripts forward there so the Tauri CLI and the Android Gradle build (which runs `npm run -- tauri ...` here) work from this folder.",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "build:icons": "node scripts/make-icons.cjs",
-    "tauri": "tauri",
-    "tauri:build": "tauri build",
-    "tauri:dev": "tauri dev",
-    "version:patch": "./scripts/version-sync.sh $(node -e \"let v=require('./package.json').version.split('-')[0].split('.'); v[2]=(+(v[2]||0))+1; console.log([v[0],v[1],v[2]].join('.'))\")",
-    "version:minor": "./scripts/version-sync.sh $(node -e \"let v=require('./package.json').version.split('-')[0].split('.'); v[1]=(+(v[1]||0))+1; v[2]=0; console.log([v[0],v[1],v[2]].join('.'))\")",
-    "version:major": "./scripts/version-sync.sh $(node -e \"let v=require('./package.json').version.split('-')[0].split('.'); v[0]=(+(v[0]||0))+1; v[1]=0; v[2]=0; console.log([v[0],v[1],v[2]].join('.'))\")",
-    "release:patch": "npm run version:patch && V=$(node -p \"require('./package.json').version\") && git add . && git commit -m \"chore: release v$V\" && git tag -fa latest -m latest && git tag -a v$V -m \"Release v$V\" && git push origin HEAD && git push -f origin latest && git push origin v$V",
-    "release:minor": "npm run version:minor && V=$(node -p \"require('./package.json').version\") && git add . && git commit -m \"chore: release v$V\" && git tag -fa latest -m latest && git tag -a v$V -m \"Release v$V\" && git push origin HEAD && git push -f origin latest && git push origin v$V",
-    "release:android": "V=$(node -p \"require('./src-tauri/tauri.android.conf.json').version\") && git tag -a android-v$V -m \"U-Download for Android v$V\" && git push origin android-v$V",
-    "release:major": "npm run version:major && V=$(node -p \"require('./package.json').version\") && git add . && git commit -m \"chore: release v$V\" && git tag -fa latest -m latest && git tag -a v$V -m \"Release v$V\" && git push origin HEAD && git push -f origin latest && git push origin v$V"
-  },
-  "dependencies": {
-    "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-dialog": "^2.3.3",
-    "@tauri-apps/plugin-notification": "^2",
-    "@tauri-apps/plugin-opener": "^2",
-    "@tauri-apps/plugin-process": "^2.4.0",
-    "@tauri-apps/plugin-store": "^2",
-    "@tauri-apps/plugin-updater": "^2.13.0",
-    "gsap": "3.12.5",
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0"
-  },
-  "devDependencies": {
-    "@tauri-apps/cli": "^2",
-    "@vitejs/plugin-react": "^4.6.0",
-    "autoprefixer": "^10.4.21",
-    "jimp": "^0.22.10",
-    "postcss": "^8.5.6",
-    "tailwindcss": "^3.4.17",
-    "vite": "^7.0.4",
-    "vitest": "^4.1.11"
+    "tauri": "web/node_modules/.bin/tauri",
+    "build": "npm --prefix web run build",
+    "dev": "npm --prefix web run dev"
   }
 }
